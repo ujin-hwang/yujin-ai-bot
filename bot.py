@@ -118,7 +118,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/towork - 집→회사 길찾기 (등록 필요)\n"
         "/tohome - 회사→집 길찾기 (등록 필요)\n"
         "/reset - 지금까지의 대화 기억 지우기\n"
-        "/setpolicy <브랜드명> <증권번호> - 브랜드별 증권번호 등록 (가입증명서에 사용)\n\n"
+        "/setpolicy <브랜드명> <증권번호> - 브랜드별 증권번호 등록 (가입증명서에 사용)\n"
+        "/brands - 등록된 브랜드(통합파일) 목록 확인\n"
+        "/resetbrand <브랜드명> - 해당 브랜드 통합파일 삭제하고 처음부터 다시 등록\n\n"
         "길찾기는 명령어 없이 그냥 '강남역까지 얼마나 걸려?', '홍대에서 여의도까지 어떻게 가?'처럼 물어보셔도 알아들어요.\n\n"
         "새 이메일이 오면 자동으로 요약해서 알려드려요. 📬\n"
         "날씨, 최신 뉴스, 맛집 등도 그냥 물어보시면 웹 검색해서 답해드려요.\n"
@@ -961,6 +963,40 @@ async def set_policy_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(f"✅ '{brand}' 브랜드의 증권번호를 등록했어요: {policy_no}")
 
 
+async def list_brands_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    if not os.path.isdir(MASTERS_DIR):
+        await update.message.reply_text("등록된 브랜드가 아직 없어요.")
+        return
+    brands = sorted(f[:-5] for f in os.listdir(MASTERS_DIR) if f.endswith(".xlsx"))
+    if not brands:
+        await update.message.reply_text("등록된 브랜드가 아직 없어요.")
+        return
+    policy_numbers = _load_policy_numbers()
+    lines = [f"- {b} ({'증권번호 등록됨' if b in policy_numbers else '⚠️ 증권번호 미등록'})" for b in brands]
+    await update.message.reply_text("📋 등록된 브랜드 목록:\n" + "\n".join(lines))
+
+
+async def reset_brand_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "사용법: /resetbrand <브랜드명>\n예: /resetbrand 월메이드\n\n"
+            "해당 브랜드의 통합파일을 삭제해요. 다음에 그 브랜드 엑셀을 올리면 그 파일을 새 기준으로 다시 등록해요.\n"
+            "정확한 브랜드명은 /brands 로 확인할 수 있어요."
+        )
+        return
+    brand = " ".join(context.args)
+    master_path = os.path.join(MASTERS_DIR, f"{brand}.xlsx")
+    if os.path.exists(master_path):
+        os.remove(master_path)
+        await update.message.reply_text(f"🗑️ '{brand}' 통합파일을 삭제했어요. 다음에 이 브랜드 엑셀을 올리면 그 파일을 새 기준으로 등록할게요.")
+    else:
+        await update.message.reply_text(f"'{brand}' 통합파일을 찾지 못했어요. /brands 로 정확한 브랜드명을 확인해주세요.")
+
+
 def _sync_brand_excel(file_bytes: bytes) -> dict | None:
     """엑셀을 읽어 브랜드를 판별하고, 저장된 통합파일과 비교해 신규/폐점 매장을 반영.
     반환: {"brand", "cold_start", "new_stores": [...], "closed_count": int, "master_bytes": bytes}
@@ -1498,6 +1534,8 @@ def main() -> None:
     app.add_handler(CommandHandler("towork", commute_to_work))
     app.add_handler(CommandHandler("tohome", commute_to_home))
     app.add_handler(CommandHandler("setpolicy", set_policy_command))
+    app.add_handler(CommandHandler("brands", list_brands_command))
+    app.add_handler(CommandHandler("resetbrand", reset_brand_command))
     app.add_handler(MessageHandler(filters.LOCATION, handle_location))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
