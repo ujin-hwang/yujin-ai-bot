@@ -123,6 +123,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/resetbrand <브랜드명> - 해당 브랜드 통합파일 삭제하고 처음부터 다시 등록\n\n"
         "길찾기는 명령어 없이 그냥 '강남역까지 얼마나 걸려?', '홍대에서 여의도까지 어떻게 가?'처럼 물어보셔도 알아들어요.\n\n"
         "새 이메일이 오면 자동으로 요약해서 알려드려요. 📬\n"
+        "메일에 정산양식 엑셀이 첨부되어 있으면, 다운로드 안 하셔도 자동으로 확인해서 신규/폐점 매장을 반영하고 가입증명서와 갱신된 통합파일을 보내드려요.\n"
         "날씨, 최신 뉴스, 맛집 등도 그냥 물어보시면 웹 검색해서 답해드려요.\n"
         "📎(첨부) 버튼으로 '위치'를 공유해주시면, 그 위치 기준으로 근처 맛집도 찾아드려요.\n\n"
         "정산양식 엑셀 파일을 보내주시면, 브랜드별 통합파일과 비교해서 새로 추가된 매장을 찾아 가입증명서 PDF를 자동으로 만들어드리고, 갱신된 통합파일도 함께 보내드려요. 📄"
@@ -808,17 +809,17 @@ def _get_brand_name(wb) -> str | None:
 
 
 def _find_type_sheets(wb, keyword: str) -> dict:
-    """시트 이름에 keyword(예: '신규매장')가 포함된 시트를 '정상'/'상설' 등으로 분류"""
+    """시트 이름에 keyword(예: '신규매장')가 포함된 시트를 '정상'/'상설' 등으로 분류.
+    담당자가 개별로 보내는 신청서는 '신규매장(정상)'이 아니라 그냥 '신규매장'처럼
+    괄호 구분 없이 오는 경우가 많은데, 이때는 일반(정상) 매장 신청으로 간주함."""
     result = {}
     for name in wb.sheetnames:
         if keyword not in name:
             continue
-        if "정상" in name:
-            result["정상"] = wb[name]
-        elif "상설" in name:
+        if "상설" in name:
             result["상설"] = wb[name]
         else:
-            result[name] = wb[name]
+            result.setdefault("정상", wb[name])
     return result
 
 
@@ -1114,6 +1115,74 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
     }
 
 
+async def _sync_and_notify(bot, chat_id: int, file_bytes: bytes) -> dict | None:
+    """정산양식 엑셀을 브랜드 통합파일과 동기화하고, 결과(가입증명서/갱신된 통합파일/요약)를
+    텔레그램으로 보냄. 텔레그램에 직접 파일을 올린 경우와, 메일에 첨부된 파일을 자동으로
+    감지한 경우 양쪽에서 공용으로 사용함.
+    브랜드를 인식하지 못하면(정산양식 형식이 아니면) 아무것도 보내지 않고 None을 반환하며,
+    이 경우 어떻게 안내할지는 호출한 쪽에서 정함(메일 첨부는 정산양식이 아닐 수도 있으니
+    조용히 넘어가고, 텔레그램 직접 업로드는 사용자에게 안내함)."""
+    try:
+        result = _sync_brand_excel(file_bytes)
+    except Exception:
+        logger.exception("엑셀 동기화 중 오류")
+        await bot.send_message(chat_id=chat_id, text="⚠️ 엑셀을 처리하는 중 오류가 발생했어요.")
+        return None
+
+    if result is None:
+        return None
+
+    brand = result["brand"]
+
+    if result["cold_start"]:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"📁 '{brand}' 통합파일을 처음 등록했어요. 앞으로 이 파일을 기준으로 신규/폐점 매장을 비교할게요.",
+        )
+        return result
+
+    if not result["new_stores"] and not result["closed_count"]:
+        await bot.send_message(chat_id=chat_id, text=f"'{brand}' 기준으로 새로운 신규/폐점 매장이 없어요.")
+        return result
+
+    if not result.get("has_policy_no"):
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"⚠️ '{brand}'의 증권번호가 등록되어 있지 않아 기본 증권번호로 가입증명서를 만들어요.",
+        )
+
+    for store in result["new_stores"]:
+        try:
+            pdf_bytes = _build_certificate_pdf(store)
+        except Exception:
+            logger.exception("가입증명서 생성 중 오류")
+            await bot.send_message(chat_id=chat_id, text=f"⚠️ '{store['store_name']}' 가입증명서 생성에 실패했어요.")
+            continue
+
+        out_name = f"{store['store_name']}_{store['store_code']}_{store['start_date_yymmdd']}.pdf"
+        await bot.send_document(
+            chat_id=chat_id,
+            document=io.BytesIO(pdf_bytes),
+            filename=out_name,
+            caption=f"📄 {store['store_name']} 가입증명서",
+        )
+
+    summary = f"✅ '{brand}' 통합파일을 갱신했어요.\n신규 매장 {len(result['new_stores'])}곳"
+    if result["closed_count"]:
+        summary += f", 폐점 매장 {result['closed_count']}곳"
+    await bot.send_message(chat_id=chat_id, text=summary)
+
+    if result.get("master_bytes"):
+        await bot.send_document(
+            chat_id=chat_id,
+            document=io.BytesIO(result["master_bytes"]),
+            filename=f"{brand}.xlsx",
+            caption=f"📎 갱신된 '{brand}' 통합파일이에요.",
+        )
+
+    return result
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
@@ -1186,61 +1255,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("파일을 받아오는 중 오류가 발생했어요.")
         return
 
-    try:
-        result = _sync_brand_excel(file_bytes)
-    except Exception:
-        logger.exception("엑셀 동기화 중 오류")
-        await update.message.reply_text("⚠️ 엑셀을 처리하는 중 오류가 발생했어요.")
-        return
-
+    result = await _sync_and_notify(context.bot, update.effective_chat.id, file_bytes)
     if result is None:
         await update.message.reply_text(
             "이 엑셀 형식은 알아보지 못했어요. 각 시트 A1 셀에 '*. 브랜드명'이 적힌 정산양식인지 확인해주세요."
-        )
-        return
-
-    brand = result["brand"]
-
-    if result["cold_start"]:
-        await update.message.reply_text(
-            f"📁 '{brand}' 통합파일을 처음 등록했어요. 앞으로 이 파일을 기준으로 신규/폐점 매장을 비교할게요."
-        )
-        return
-
-    if not result["new_stores"] and not result["closed_count"]:
-        await update.message.reply_text(f"'{brand}' 기준으로 새로운 신규/폐점 매장이 없어요.")
-        return
-
-    if not result.get("has_policy_no"):
-        await update.message.reply_text(
-            f"⚠️ '{brand}'의 증권번호가 등록되어 있지 않아 기본 증권번호로 가입증명서를 만들어요."
-        )
-
-    for store in result["new_stores"]:
-        try:
-            pdf_bytes = _build_certificate_pdf(store)
-        except Exception:
-            logger.exception("가입증명서 생성 중 오류")
-            await update.message.reply_text(f"⚠️ '{store['store_name']}' 가입증명서 생성에 실패했어요.")
-            continue
-
-        out_name = f"{store['store_name']}_{store['store_code']}_{store['start_date_yymmdd']}.pdf"
-        await update.message.reply_document(
-            document=io.BytesIO(pdf_bytes),
-            filename=out_name,
-            caption=f"📄 {store['store_name']} 가입증명서",
-        )
-
-    summary = f"✅ '{brand}' 통합파일을 갱신했어요.\n신규 매장 {len(result['new_stores'])}곳"
-    if result["closed_count"]:
-        summary += f", 폐점 매장 {result['closed_count']}곳"
-    await update.message.reply_text(summary)
-
-    if result.get("master_bytes"):
-        await update.message.reply_document(
-            document=io.BytesIO(result["master_bytes"]),
-            filename=f"{brand}.xlsx",
-            caption=f"📎 갱신된 '{brand}' 통합파일이에요.",
         )
 
 
@@ -1457,6 +1475,27 @@ def _get_email_body(msg: email.message.Message) -> str:
             return ""
 
 
+def _extract_xlsx_attachments(msg: email.message.Message) -> list[tuple[str, bytes]]:
+    """메일에서 .xlsx 첨부파일만 골라 (파일명, 파일바이트) 목록으로 반환"""
+    attachments = []
+    if not msg.is_multipart():
+        return attachments
+    for part in msg.walk():
+        filename = part.get_filename()
+        if not filename:
+            continue
+        filename = _decode_mime_words(filename)
+        if not filename.lower().endswith(".xlsx"):
+            continue
+        try:
+            payload = part.get_payload(decode=True)
+        except Exception:
+            continue
+        if payload:
+            attachments.append((filename, payload))
+    return attachments
+
+
 async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
     global last_uid_seen
 
@@ -1514,6 +1553,17 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             text = f"📬 새 메일 도착\n\n보낸사람: {sender}\n제목: {subject}\n\n요약:\n{summary}"
             await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=text)
+
+            # 정산양식 엑셀 첨부파일이 있으면 자동으로 브랜드 통합파일과 동기화
+            for att_filename, att_bytes in _extract_xlsx_attachments(msg):
+                try:
+                    result = await _sync_and_notify(context.bot, ALLOWED_USER_ID, att_bytes)
+                except Exception:
+                    logger.exception("메일 첨부 엑셀 처리 중 오류")
+                    continue
+                if result is None:
+                    # 정산양식 형식이 아닌 일반 첨부파일일 수 있으니 조용히 넘어감
+                    logger.info("메일 첨부파일 '%s'은 정산양식 형식이 아니라 건너뜀", att_filename)
 
         last_uid_seen = latest_uid
         imap.logout()
