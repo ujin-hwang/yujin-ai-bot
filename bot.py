@@ -81,6 +81,8 @@ CERT_FONT_SCALE = 4  # 텍스트를 이미지로 그릴 때 선명하게 보이�
 MASTERS_DIR = os.path.join(_BASE_DIR, "masters")
 # 브랜드별 증권번호를 저장해두는 파일 (파일명에서 못 찾을 때 사용)
 POLICY_NUMBERS_FILE = os.path.join(_BASE_DIR, "policy_numbers.json")
+# 브랜드별로 파일을 보내드릴 때 쓸 표시용 파일명(엑셀 A1 셀 이름과 다르게 쓰고 싶을 때)
+BRAND_NAMES_FILE = os.path.join(_BASE_DIR, "brand_names.json")
 
 SYSTEM_PROMPT = (
     "당신은 사용자의 개인 AI 비서입니다. 한국어로 친절하고 간결하게 답변하세요. "
@@ -122,7 +124,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/reset - 지금까지의 대화 기억 지우기\n"
         "/setpolicy <브랜드명> <증권번호> - 브랜드별 증권번호 등록 (가입증명서에 사용)\n"
         "/brands - 등록된 브랜드(통합파일) 목록 확인\n"
-        "/resetbrand <브랜드명> - 해당 브랜드 통합파일 삭제하고 처음부터 다시 등록\n\n"
+        "/resetbrand <브랜드명> - 해당 브랜드 통합파일 삭제하고 처음부터 다시 등록\n"
+        "/setbrandname <브랜드명> <표시할 이름> - 통합파일을 보내드릴 때 쓸 파일명 변경\n"
+        "/sendmaster <브랜드명> - 지금 저장된 통합파일을 새로 올리지 않고 다시 받아보기\n\n"
         "길찾기는 명령어 없이 그냥 '강남역까지 얼마나 걸려?', '홍대에서 여의도까지 어떻게 가?'처럼 물어보셔도 알아들어요.\n\n"
         "새 이메일이 오면 자동으로 요약해서 알려드려요. 📬\n"
         "메일에 정산양식 엑셀이 첨부되어 있으면, 다운로드 안 하셔도 자동으로 확인해서 신규/폐점 매장을 반영하고 가입증명서와 갱신된 통합파일을 보내드려요.\n"
@@ -1032,6 +1036,44 @@ async def set_policy_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(f"✅ '{brand}' 브랜드의 증권번호를 등록했어요: {policy_no}")
 
 
+def _load_brand_names() -> dict:
+    try:
+        with open(BRAND_NAMES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_brand_names(brand_names: dict) -> None:
+    os.makedirs(os.path.dirname(BRAND_NAMES_FILE), exist_ok=True)
+    with open(BRAND_NAMES_FILE, "w", encoding="utf-8") as f:
+        json.dump(brand_names, f, ensure_ascii=False, indent=2)
+
+
+def _display_name(brand: str) -> str:
+    """봇이 파일을 보내드릴 때 쓸 이름. 따로 지정해둔 게 있으면 그 이름, 없으면 브랜드명(A1 셀 이름) 그대로."""
+    return _load_brand_names().get(brand, brand)
+
+
+async def set_brand_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "사용법: /setbrandname <브랜드명> <파일에 표시할 이름>\n"
+            "예: /setbrandname 올리비아로렌&주얼리 올리비아로렌&오뷔엘알&주얼리\n\n"
+            "브랜드명(첫 번째)은 /brands 로 확인되는 이름과 정확히 같아야 해요. "
+            "엑셀 A1 셀이나 신규/폐점 매장 비교 기준은 그대로 두고, 봇이 보내드리는 통합파일의 이름만 바뀌어요."
+        )
+        return
+    brand = context.args[0]
+    new_name = " ".join(context.args[1:])
+    brand_names = _load_brand_names()
+    brand_names[brand] = new_name
+    _save_brand_names(brand_names)
+    await update.message.reply_text(f"✅ 이제 '{brand}' 통합파일을 보내드릴 때 '{new_name}.xlsx'로 보내드릴게요.")
+
+
 async def list_brands_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
@@ -1043,7 +1085,13 @@ async def list_brands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("등록된 브랜드가 아직 없어요.")
         return
     policy_numbers = _load_policy_numbers()
-    lines = [f"- {b} ({'증권번호 등록됨' if b in policy_numbers else '⚠️ 증권번호 미등록'})" for b in brands]
+    brand_names = _load_brand_names()
+    lines = []
+    for b in brands:
+        status = "증권번호 등록됨" if b in policy_numbers else "⚠️ 증권번호 미등록"
+        if b in brand_names:
+            status += f", 표시명: {brand_names[b]}"
+        lines.append(f"- {b} ({status})")
     await update.message.reply_text("📋 등록된 브랜드 목록:\n" + "\n".join(lines))
 
 
@@ -1064,6 +1112,31 @@ async def reset_brand_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(f"🗑️ '{brand}' 통합파일을 삭제했어요. 다음에 이 브랜드 엑셀을 올리면 그 파일을 새 기준으로 등록할게요.")
     else:
         await update.message.reply_text(f"'{brand}' 통합파일을 찾지 못했어요. /brands 로 정확한 브랜드명을 확인해주세요.")
+
+
+async def send_master_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """지금 저장되어 있는 통합파일을 새로 올릴 필요 없이 그대로(최신 파일명 등 반영해서) 다시 받아봄"""
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "사용법: /sendmaster <브랜드명>\n예: /sendmaster 트레몰로\n\n"
+            "지금 저장되어 있는 통합파일을 다시 보내드려요. 정확한 브랜드명은 /brands 로 확인할 수 있어요."
+        )
+        return
+    brand = " ".join(context.args)
+    master_path = os.path.join(MASTERS_DIR, f"{brand}.xlsx")
+    if not os.path.exists(master_path):
+        await update.message.reply_text(f"'{brand}' 통합파일을 찾지 못했어요. /brands 로 정확한 브랜드명을 확인해주세요.")
+        return
+    with open(master_path, "rb") as f:
+        master_bytes = f.read()
+    display_name = _display_name(brand)
+    await update.message.reply_document(
+        document=io.BytesIO(master_bytes),
+        filename=f"{display_name}.xlsx",
+        caption=f"📎 '{display_name}' 통합파일이에요.",
+    )
 
 
 def _sync_brand_excel(file_bytes: bytes) -> dict | None:
@@ -1253,11 +1326,12 @@ async def _sync_and_notify(bot, chat_id: int, file_bytes: bytes) -> dict | None:
     await bot.send_message(chat_id=chat_id, text=summary)
 
     if result.get("master_bytes"):
+        display_name = _display_name(brand)
         await bot.send_document(
             chat_id=chat_id,
             document=io.BytesIO(result["master_bytes"]),
-            filename=f"{brand}.xlsx",
-            caption=f"📎 갱신된 '{brand}' 통합파일이에요.",
+            filename=f"{display_name}.xlsx",
+            caption=f"📎 갱신된 '{display_name}' 통합파일이에요.",
         )
 
     return result
@@ -1666,6 +1740,8 @@ def main() -> None:
     app.add_handler(CommandHandler("setpolicy", set_policy_command))
     app.add_handler(CommandHandler("brands", list_brands_command))
     app.add_handler(CommandHandler("resetbrand", reset_brand_command))
+    app.add_handler(CommandHandler("setbrandname", set_brand_name_command))
+    app.add_handler(CommandHandler("sendmaster", send_master_command))
     app.add_handler(MessageHandler(filters.LOCATION, handle_location))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
