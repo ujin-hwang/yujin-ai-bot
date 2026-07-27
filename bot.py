@@ -823,6 +823,22 @@ def _find_type_sheets(wb, keyword: str) -> dict:
     return result
 
 
+def _strip_external_links(wb) -> None:
+    """일부 담당자 취합본에는 예전에 다른 파일(예: 카카오톡으로 받은 엑셀)을 참조하던 '외부 워크북
+    링크'가 남아있는 경우가 있음(수식이 [1]시트명! 형태). openpyxl로 다시 저장하면 이 외부 링크의
+    내부 참조가 깨져서 엑셀에서 '내용에 문제가 있습니다' 복구 경고가 뜨는 원인이 됨. 다행히 같은
+    이름의 시트가 통합문서 안에 이미 있는 경우가 대부분이라, [숫자] 표시만 지워서 로컬 시트를
+    가리키도록 바꾸고, 더 이상 쓰이지 않는 외부 링크 정의 자체도 제거함."""
+    if not getattr(wb, "_external_links", None):
+        return
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                if isinstance(cell.value, str) and cell.value.startswith("=") and re.search(r"\[\d+\]", cell.value):
+                    cell.value = re.sub(r"\[\d+\]", "", cell.value)
+    wb._external_links = []
+
+
 SKIP_WRITE_FIELDS = {"월별", "순번"}
 
 
@@ -1098,6 +1114,8 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
 
     if not new_stores and not closed_count:
         return {"brand": brand, "cold_start": False, "new_stores": [], "closed_count": 0, "master_bytes": None}
+
+    _strip_external_links(master_wb)
 
     out = io.BytesIO()
     master_wb.save(out)
