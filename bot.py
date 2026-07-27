@@ -3,6 +3,7 @@ import io
 import re
 import json
 import asyncio
+import datetime as dt
 import logging
 import imaplib
 import smtplib
@@ -16,6 +17,7 @@ import httpx
 import openpyxl
 from openpyxl.formula.translate import Translator
 from openpyxl.cell.cell import MergedCell
+from openpyxl.styles import PatternFill
 from PIL import Image, ImageDraw, ImageFont
 from reportlab.pdfgen import canvas as pdf_canvas
 from reportlab.lib.utils import ImageReader
@@ -867,11 +869,16 @@ def _find_template_row(ws, header_map: dict, min_row: int, target_row: int) -> i
     return target_row
 
 
+YELLOW_FILL = PatternFill(start_color="FFFFFF00", end_color="FFFFFF00", fill_type="solid")
+NO_FILL = PatternFill(fill_type=None)
+
+
 def _write_row(ws, header_map: dict, target_row: int, values: dict, template_row: int) -> None:
     """각 컬럼마다 '기준 행(template_row)'의 셀이 수식이면 그 수식을 target_row로 복사(번역)하고,
     수식이 아니면(원본 입력값 칸이면) values의 값을 그대로 채워 넣음. 필드명을 하드코딩해서
     구분하지 않고, 실제로 그 칸이 수식인지 아닌지를 셀 단위로 직접 확인하기 때문에 파일마다
-    수식이 있는 칸이 달라도(예: 폐점매장의 매장명이 수식인 경우 등) 안전하게 동작함."""
+    수식이 있는 칸이 달라도(예: 폐점매장의 매장명이 수식인 경우 등) 안전하게 동작함.
+    (음영 처리는 이 함수가 아니라 _recolor_by_period가 접수일자 기준으로 별도로 담당함)"""
     for key, idx in header_map.items():
         if key in SKIP_WRITE_FIELDS:
             continue
@@ -879,6 +886,7 @@ def _write_row(ws, header_map: dict, target_row: int, values: dict, template_row
         target_cell = ws.cell(row=target_row, column=col)
         if isinstance(target_cell, MergedCell):
             continue
+
         template_cell = ws.cell(row=template_row, column=col)
         template_val = template_cell.value
         is_formula = isinstance(template_val, str) and template_val.startswith("=")
@@ -900,6 +908,50 @@ def _write_row(ws, header_map: dict, target_row: int, values: dict, template_row
             prev = ws.cell(row=template_row, column=seq_idx + 1).value
             if isinstance(prev, (int, float)):
                 ws.cell(row=target_row, column=seq_idx + 1).value = int(prev) + 1
+
+
+def _current_period(today: dt.date | None = None) -> tuple[dt.date, dt.date]:
+    """'해당월 16일 ~ 다음달 15일'을 하나의 정산 기간으로 봄(예: 7/27이면 7/16~8/15).
+    오늘이 1~15일 사이면 아직 저번 기간(전달 16일~이번달 15일)이 진행 중인 걸로 봄."""
+    today = today or dt.date.today()
+    if today.day >= 16:
+        start = dt.date(today.year, today.month, 16)
+        if today.month == 12:
+            end = dt.date(today.year + 1, 1, 15)
+        else:
+            end = dt.date(today.year, today.month + 1, 15)
+    else:
+        end = dt.date(today.year, today.month, 15)
+        if today.month == 1:
+            start = dt.date(today.year - 1, 12, 16)
+        else:
+            start = dt.date(today.year, today.month - 1, 16)
+    return start, end
+
+
+def _recolor_by_period(ws, header_map: dict, min_row: int, period_start: dt.date, period_end: dt.date) -> None:
+    """접수일자가 이번 정산 기간(16일~다음달 15일) 안이면 노란색, 기간이 지난 항목이면 다시
+    흰색(음영 없음)으로 되돌림. 월별/순번 칸은 그대로 둠. 신규매장/폐점매장 시트 양쪽 다 이 규칙을
+    적용해서, 이번 달에 새로 들어온 신규/폐점 매장을 한눈에 볼 수 있게 함."""
+    date_idx = header_map.get("접수일자")
+    name_idx = header_map.get("매장명")
+    if date_idx is None or name_idx is None:
+        return
+    for r in range(min_row, ws.max_row + 1):
+        name_val = ws.cell(row=r, column=name_idx + 1).value
+        if not name_val:
+            continue
+        date_val = ws.cell(row=r, column=date_idx + 1).value
+        row_date = date_val.date() if hasattr(date_val, "date") else None
+        in_period = row_date is not None and period_start <= row_date <= period_end
+        fill = YELLOW_FILL if in_period else NO_FILL
+        for key, idx in header_map.items():
+            if key in SKIP_WRITE_FIELDS:
+                continue
+            cell = ws.cell(row=r, column=idx + 1)
+            if isinstance(cell, MergedCell):
+                continue
+            cell.fill = fill
 
 
 def _extract_rate(ws, header_map: dict, field: str, pattern: str, default: float, min_row: int) -> float:
@@ -1114,6 +1166,16 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
 
     if not new_stores and not closed_count:
         return {"brand": brand, "cold_start": False, "new_stores": [], "closed_count": 0, "master_bytes": None}
+
+    # 이번 정산 기간(16일~다음달 15일) 기준으로 신규/폐점매장 시트 전체를 다시 칠함.
+    # 새로 추가된 항목뿐 아니라, 기간이 지나 더 이상 '이번 달' 항목이 아닌 예전 노란색도
+    # 흰색으로 되돌려서 항상 현재 기간만 노랗게 보이도록 함.
+    period_start, period_end = _current_period()
+    for sheets_dict in (master_new_sheets, master_closed_sheets):
+        for master_ws in sheets_dict.values():
+            header, min_row = _build_header_map(master_ws)
+            if header:
+                _recolor_by_period(master_ws, header, min_row, period_start, period_end)
 
     _strip_external_links(master_wb)
 
