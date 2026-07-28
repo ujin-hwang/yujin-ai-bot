@@ -1641,7 +1641,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
 
-    if not os.path.exists(CERT_TEMPLATE_PATH) or not os.path.exists(CERT_FONT_PATH):
+    # 서식(PDF)은 이제 브랜드마다 따로 있고 브랜드별로 나중에 확인하니, 여기서는 모든 브랜드가
+    # 공통으로 필요한 폰트 파일만 확인함(폰트가 없으면 글자 자체를 못 그리므로 확실한 차단 사유).
+    if not os.path.exists(CERT_FONT_PATH):
         await update.message.reply_text("가입증명서 생성 기능이 아직 설정되지 않았어요.")
         return
 
