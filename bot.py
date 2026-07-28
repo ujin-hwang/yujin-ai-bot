@@ -737,6 +737,7 @@ def _build_certificate_pdf(data: dict) -> bytes:
 # (예: 올리비아로렌 취합본은 '재고' 대신 '재고자산'이라고 씀 — 이걸 못 맞추면 재고 금액이 통째로 빠짐)
 HEADER_SYNONYMS = {
     "재고자산": "재고",
+    "시설": "시설/비품",
 }
 
 
@@ -804,14 +805,24 @@ def _extract_data_rows(ws, header_map: dict, min_row: int) -> list:
     return out
 
 
+def _val_key(v) -> str:
+    """셀 값을 dedup 비교용 문자열로 정규화 (datetime이든 문자열이든 동일하게 비교 가능하게)"""
+    if v is None:
+        return ""
+    if hasattr(v, "isoformat"):
+        return v.isoformat()
+    return str(v).strip()
+
+
 def _dedup_key(vals: dict) -> tuple:
+    """매장코드가 같아도 보험시작일이 다르면(단기 특판 연장 등) 별개 건으로 취급.
+    보험시작일이 없으면 접수일자로 대체."""
     code = vals.get("매장코드")
+    period_key = _val_key(vals.get("보험시작일")) or _val_key(vals.get("접수일자"))
     if code:
-        return ("code", str(code).strip())
+        return ("code", str(code).strip(), period_key)
     name = str(vals.get("매장명") or "").strip()
-    date = vals.get("접수일자")
-    date_key = date.isoformat() if hasattr(date, "isoformat") else str(date)
-    return ("namedate", name, date_key)
+    return ("namedate", name, period_key)
 
 
 def _get_brand_name(wb) -> str | None:
@@ -943,6 +954,27 @@ def _current_period(today: dt.date | None = None) -> tuple[dt.date, dt.date]:
     return start, end
 
 
+def _parse_date_val(date_val) -> dt.date | None:
+    """접수일자 셀 값을 날짜로 변환. datetime/date 객체는 그대로, 문자열('26.07.16',
+    '2026-07-16', '2026.07.16' 등)은 여러 형식을 시도해서 파싱. 담당자가 개별로 셀에
+    직접 타이핑한 파일은 날짜가 진짜 날짜형이 아니라 문자열로 들어오는 경우가 있음."""
+    if date_val is None:
+        return None
+    if hasattr(date_val, "date"):
+        return date_val.date()
+    if isinstance(date_val, dt.date):
+        return date_val
+    s = str(date_val).strip()
+    if not s:
+        return None
+    for fmt in ("%y.%m.%d", "%Y.%m.%d", "%y-%m-%d", "%Y-%m-%d", "%y/%m/%d", "%Y/%m/%d"):
+        try:
+            return dt.datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
 def _recolor_by_period(ws, header_map: dict, min_row: int, period_start: dt.date, period_end: dt.date) -> None:
     """접수일자가 이번 정산 기간(16일~다음달 15일) 안이면 노란색, 기간이 지난 항목이면 다시
     흰색(음영 없음)으로 되돌림. 월별/순번 칸은 그대로 둠. 신규매장/폐점매장 시트 양쪽 다 이 규칙을
@@ -956,7 +988,7 @@ def _recolor_by_period(ws, header_map: dict, min_row: int, period_start: dt.date
         if not name_val:
             continue
         date_val = ws.cell(row=r, column=date_idx + 1).value
-        row_date = date_val.date() if hasattr(date_val, "date") else None
+        row_date = _parse_date_val(date_val)
         in_period = row_date is not None and period_start <= row_date <= period_end
         fill = YELLOW_FILL if in_period else NO_FILL
         for key, idx in header_map.items():
