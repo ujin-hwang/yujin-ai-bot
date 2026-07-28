@@ -72,6 +72,21 @@ def _find_asset(filename: str) -> str:
     return os.path.join(_BASE_DIR, filename)
 
 
+def _find_file_ci(directory: str, filename: str) -> str | None:
+    """Render 서버(Linux)는 대소문자를 구분해서, GitHub 웹에서 파일 이름을 바꿀 때
+    확장자가 의도치 않게 .PDF처럼 대문자로 바뀌어 있으면 .pdf로 찾다가 못 찾는 경우가 생김.
+    그래서 폴더 안 파일 목록을 대소문자 구분 없이 한 번 더 확인함."""
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return None
+    target = filename.lower()
+    for entry in entries:
+        if entry.lower() == target:
+            return os.path.join(directory, entry)
+    return None
+
+
 CERT_FONT_PATH = _find_asset("NotoSerifKR.ttf")
 CERT_TEMPLATE_PATH = _find_asset("cert_template.pdf")  # 브랜드별 서식이 없을 때 쓰는 기본값(트레몰로 서식)
 CERT_PAGE_W, CERT_PAGE_H = 595.2, 841.92
@@ -688,13 +703,25 @@ DEFAULT_POLICY_NO = "82509565736000"
 
 
 def _cert_bundled_template_candidates(brand: str) -> list:
-    """코드와 함께 배포되어 재배포해도 안 사라지는 브랜드별 서식을 찾을 수 있는 후보 경로들.
+    """코드와 함께 배포되어 재배포해도 안 사라지는 브랜드별 서식을 찾을 수 있는 후보 (디렉터리, 파일명) 목록.
     GitHub에 assets 폴더를 따로 안 만들고 bot.py 등과 같은 위치(루트)에 그냥 올리는 경우가 많아서,
     assets/cert_templates 안과 루트(cert_template_브랜드명.pdf) 둘 다 확인함."""
     return [
-        os.path.join(CERT_BUNDLED_TEMPLATES_DIR, f"{brand}.pdf"),
-        os.path.join(_BASE_DIR, f"cert_template_{brand}.pdf"),
+        (CERT_BUNDLED_TEMPLATES_DIR, f"{brand}.pdf"),
+        (_BASE_DIR, f"cert_template_{brand}.pdf"),
     ]
+
+
+def _resolve_cert_bundled_template(brand: str) -> str | None:
+    for directory, filename in _cert_bundled_template_candidates(brand):
+        exact = os.path.join(directory, filename)
+        if os.path.exists(exact):
+            return exact
+        # GitHub 웹에서 파일명을 바꿀 때 확장자가 .PDF로 바뀌어 있는 경우가 있어 대소문자 구분 없이도 확인
+        found = _find_file_ci(directory, filename)
+        if found:
+            return found
+    return None
 
 
 def _cert_template_path_for_brand(brand: str) -> str:
@@ -703,9 +730,9 @@ def _cert_template_path_for_brand(brand: str) -> str:
     custom_path = os.path.join(CERT_TEMPLATES_DIR, f"{brand}.pdf")
     if os.path.exists(custom_path):
         return custom_path
-    for candidate in _cert_bundled_template_candidates(brand):
-        if os.path.exists(candidate):
-            return candidate
+    bundled = _resolve_cert_bundled_template(brand)
+    if bundled:
+        return bundled
     return CERT_TEMPLATE_PATH
 
 
@@ -718,7 +745,7 @@ def _has_cert_template(brand: str) -> bool:
     계약자/증권번호 등이 실제와 다르게 나올 수 있어 사용자에게 알려줘야 함."""
     if os.path.exists(os.path.join(CERT_TEMPLATES_DIR, f"{brand}.pdf")):
         return True
-    return any(os.path.exists(c) for c in _cert_bundled_template_candidates(brand))
+    return _resolve_cert_bundled_template(brand) is not None
 
 
 # 가입증명서용 폰트(NotoSerifKR)에 글자가 비어있는(빈 도형) 특수문자들을 폰트가
