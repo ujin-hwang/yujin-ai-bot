@@ -83,6 +83,8 @@ MASTERS_DIR = os.path.join(_BASE_DIR, "masters")
 POLICY_NUMBERS_FILE = os.path.join(_BASE_DIR, "policy_numbers.json")
 # 브랜드별로 파일을 보내드릴 때 쓸 표시용 파일명(엑셀 A1 셀 이름과 다르게 쓰고 싶을 때)
 BRAND_NAMES_FILE = os.path.join(_BASE_DIR, "brand_names.json")
+# 담당자마다 A1 셀에 브랜드명을 다르게 적어 보내는 경우, 같은 브랜드로 취급하도록 이름을 통일시켜주는 매핑
+BRAND_ALIASES_FILE = os.path.join(_BASE_DIR, "brand_aliases.json")
 
 SYSTEM_PROMPT = (
     "당신은 사용자의 개인 AI 비서입니다. 한국어로 친절하고 간결하게 답변하세요. "
@@ -126,7 +128,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/brands - 등록된 브랜드(통합파일) 목록 확인\n"
         "/resetbrand <브랜드명> - 해당 브랜드 통합파일 삭제하고 처음부터 다시 등록\n"
         "/setbrandname <브랜드명> <표시할 이름> - 통합파일을 보내드릴 때 쓸 파일명 변경\n"
-        "/sendmaster <브랜드명> - 지금 저장된 통합파일을 새로 올리지 않고 다시 받아보기\n\n"
+        "/sendmaster <브랜드명> - 지금 저장된 통합파일을 새로 올리지 않고 다시 받아보기\n"
+        "/setbrandalias <다르게 인식된 이름> <진짜 브랜드명> - 담당자마다 다르게 적는 브랜드명을 하나로 통일\n\n"
         "길찾기는 명령어 없이 그냥 '강남역까지 얼마나 걸려?', '홍대에서 여의도까지 어떻게 가?'처럼 물어보셔도 알아들어요.\n\n"
         "새 이메일이 오면 자동으로 요약해서 알려드려요. 📬\n"
         "메일에 정산양식 엑셀이 첨부되어 있으면, 다운로드 안 하셔도 자동으로 확인해서 신규/폐점 매장을 반영하고 가입증명서와 갱신된 통합파일을 보내드려요.\n"
@@ -730,13 +733,20 @@ def _build_certificate_pdf(data: dict) -> bytes:
     return out.getvalue()
 
 
+# 브랜드/담당자마다 같은 항목을 다른 이름으로 적는 경우가 있어서, 정규화 후 이 표로 한 번 더 통일함
+# (예: 올리비아로렌 취합본은 '재고' 대신 '재고자산'이라고 씀 — 이걸 못 맞추면 재고 금액이 통째로 빠짐)
+HEADER_SYNONYMS = {
+    "재고자산": "재고",
+}
+
+
 def _norm_header(s) -> str:
     if s is None:
         return ""
     s = str(s).replace("\n", "").strip()
     s = re.sub(r"\([^)]*\)", "", s)  # 괄호 안 요율/단가 등은 파일마다 달라서 제거
     s = s.replace(" ", "")
-    return s
+    return HEADER_SYNONYMS.get(s, s)
 
 
 def _find_header_row(ws, search_upto: int = 6) -> int | None:
@@ -1074,6 +1084,46 @@ async def set_brand_name_command(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(f"✅ 이제 '{brand}' 통합파일을 보내드릴 때 '{new_name}.xlsx'로 보내드릴게요.")
 
 
+def _load_brand_aliases() -> dict:
+    try:
+        with open(BRAND_ALIASES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_brand_aliases(aliases: dict) -> None:
+    os.makedirs(os.path.dirname(BRAND_ALIASES_FILE), exist_ok=True)
+    with open(BRAND_ALIASES_FILE, "w", encoding="utf-8") as f:
+        json.dump(aliases, f, ensure_ascii=False, indent=2)
+
+
+def _resolve_brand_alias(brand: str) -> str:
+    """담당자마다 A1 셀에 브랜드명을 조금씩 다르게 적어 보내는 경우가 있어서(예: '올리비아로렌&주얼리'
+    vs '올리비아로렌&오뷔엘알&주얼리'), 등록해둔 별칭이 있으면 진짜(정식) 브랜드명으로 바꿔줌.
+    이걸 안 하면 같은 브랜드인데 이름이 살짝 달라서 별도의 새 통합파일로 쪼개져 버림."""
+    return _load_brand_aliases().get(brand, brand)
+
+
+async def set_brand_alias_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "사용법: /setbrandalias <다르게 인식된 이름> <진짜 브랜드명>\n"
+            "예: /setbrandalias 올리비아로렌&주얼리 올리비아로렌&오뷔엘알&주얼리\n\n"
+            "어떤 담당자가 보낸 엑셀의 브랜드명이 <다르게 인식된 이름>으로 나오면, 이제부터 <진짜 브랜드명>의 "
+            "통합파일로 합쳐서 처리해요. 진짜 브랜드명은 /brands 로 확인할 수 있어요."
+        )
+        return
+    alias = context.args[0]
+    canonical = " ".join(context.args[1:])
+    aliases = _load_brand_aliases()
+    aliases[alias] = canonical
+    _save_brand_aliases(aliases)
+    await update.message.reply_text(f"✅ 앞으로 '{alias}'로 인식되는 엑셀은 '{canonical}' 통합파일로 합쳐서 처리할게요.")
+
+
 async def list_brands_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
@@ -1086,11 +1136,15 @@ async def list_brands_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     policy_numbers = _load_policy_numbers()
     brand_names = _load_brand_names()
+    aliases = _load_brand_aliases()
     lines = []
     for b in brands:
         status = "증권번호 등록됨" if b in policy_numbers else "⚠️ 증권번호 미등록"
         if b in brand_names:
             status += f", 표시명: {brand_names[b]}"
+        alias_list = [a for a, c in aliases.items() if c == b]
+        if alias_list:
+            status += f", 별칭: {', '.join(alias_list)}"
         lines.append(f"- {b} ({status})")
     await update.message.reply_text("📋 등록된 브랜드 목록:\n" + "\n".join(lines))
 
@@ -1152,6 +1206,7 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
     brand = _get_brand_name(input_wb)
     if not brand:
         return None
+    brand = _resolve_brand_alias(brand)
 
     os.makedirs(MASTERS_DIR, exist_ok=True)
     master_path = os.path.join(MASTERS_DIR, f"{brand}.xlsx")
@@ -1742,6 +1797,7 @@ def main() -> None:
     app.add_handler(CommandHandler("resetbrand", reset_brand_command))
     app.add_handler(CommandHandler("setbrandname", set_brand_name_command))
     app.add_handler(CommandHandler("sendmaster", send_master_command))
+    app.add_handler(CommandHandler("setbrandalias", set_brand_alias_command))
     app.add_handler(MessageHandler(filters.LOCATION, handle_location))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
