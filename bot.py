@@ -687,16 +687,25 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 DEFAULT_POLICY_NO = "82509565736000"
 
 
+def _cert_bundled_template_candidates(brand: str) -> list:
+    """코드와 함께 배포되어 재배포해도 안 사라지는 브랜드별 서식을 찾을 수 있는 후보 경로들.
+    GitHub에 assets 폴더를 따로 안 만들고 bot.py 등과 같은 위치(루트)에 그냥 올리는 경우가 많아서,
+    assets/cert_templates 안과 루트(cert_template_브랜드명.pdf) 둘 다 확인함."""
+    return [
+        os.path.join(CERT_BUNDLED_TEMPLATES_DIR, f"{brand}.pdf"),
+        os.path.join(_BASE_DIR, f"cert_template_{brand}.pdf"),
+    ]
+
+
 def _cert_template_path_for_brand(brand: str) -> str:
     """브랜드별 가입증명서 원본 서식 경로. 순서: 사용자가 /setcerttemplate로 직접 등록한 것(서버 디스크,
-    재배포시 사라짐) -> 코드에 미리 등록되어 배포되는 것(assets/cert_templates, 재배포에도 안전) ->
-    아무것도 없으면 기본(트레몰로) 서식."""
+    재배포시 사라짐) -> 코드와 함께 배포되는 것(재배포에도 안전) -> 아무것도 없으면 기본(트레몰로) 서식."""
     custom_path = os.path.join(CERT_TEMPLATES_DIR, f"{brand}.pdf")
     if os.path.exists(custom_path):
         return custom_path
-    bundled_path = os.path.join(CERT_BUNDLED_TEMPLATES_DIR, f"{brand}.pdf")
-    if os.path.exists(bundled_path):
-        return bundled_path
+    for candidate in _cert_bundled_template_candidates(brand):
+        if os.path.exists(candidate):
+            return candidate
     return CERT_TEMPLATE_PATH
 
 
@@ -709,9 +718,7 @@ def _has_cert_template(brand: str) -> bool:
     계약자/증권번호 등이 실제와 다르게 나올 수 있어 사용자에게 알려줘야 함."""
     if os.path.exists(os.path.join(CERT_TEMPLATES_DIR, f"{brand}.pdf")):
         return True
-    if os.path.exists(os.path.join(CERT_BUNDLED_TEMPLATES_DIR, f"{brand}.pdf")):
-        return True
-    return False
+    return any(os.path.exists(c) for c in _cert_bundled_template_candidates(brand))
 
 
 # 가입증명서용 폰트(NotoSerifKR)에 글자가 비어있는(빈 도형) 특수문자들을 폰트가
