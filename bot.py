@@ -73,9 +73,22 @@ def _find_asset(filename: str) -> str:
 
 
 CERT_FONT_PATH = _find_asset("NotoSerifKR.ttf")
-CERT_TEMPLATE_PATH = _find_asset("cert_template.pdf")
+CERT_TEMPLATE_PATH = _find_asset("cert_template.pdf")  # 브랜드별 서식이 없을 때 쓰는 기본값(트레몰로 서식)
 CERT_PAGE_W, CERT_PAGE_H = 595.2, 841.92
 CERT_FONT_SCALE = 4  # 텍스트를 이미지로 그릴 때 선명하게 보이도록 확대 비율
+
+# 브랜드별 가입증명서 서식에서 5개 항목(보험기간/점포명/주소/보상한도액/보험료) 줄의 세로 위치(top, pt)와
+# '보험료' 값 칸의 오른쪽 한계(premium_x1 - 바로 뒤 '원' 글자를 안 지우면서 값을 덮을 수 있는 최대 x좌표).
+# 같은 디자인이라도 브랜드마다 '계약자'/'주소' 줄 길이가 달라 아래 항목들이 조금씩 밀려 있고, '원' 글자
+# 시작 위치도 살짝 달라서, 실제 발급된 예시 증명서에서 좌표를 직접 재서 브랜드별로 따로 저장해둠
+# (pdfplumber로 측정). premium_x1을 너무 좁게 잡으면 새로 쓰는 금액이 기존 서식 금액보다 짧을 때
+# 예전 숫자 일부가 안 가려지고 남아 보이는 문제가 생김.
+DEFAULT_CERT_ROWS = {"period": 201.4, "store_name": 295.3, "address": 313.3, "limit": 367.6, "premium": 439.8, "premium_x1": 160}
+CERT_ROWS_BY_BRAND = {
+    "트레몰로": {"period": 201.4, "store_name": 295.3, "address": 313.3, "limit": 367.6, "premium": 439.8, "premium_x1": 162.7},
+    "월메이드": {"period": 183.4, "store_name": 277.1, "address": 300.6, "limit": 360.1, "premium": 432.4, "premium_x1": 168.7},
+    "올리비아로렌&오뷔엘알&주얼리": {"period": 183.4, "store_name": 277.1, "address": 295.3, "limit": 349.6, "premium": 421.8, "premium_x1": 168.7},
+}
 
 # 브랜드별 정산 통합파일을 서버에 계속 보관/갱신하는 폴더
 MASTERS_DIR = os.path.join(_BASE_DIR, "masters")
@@ -85,6 +98,14 @@ POLICY_NUMBERS_FILE = os.path.join(_BASE_DIR, "policy_numbers.json")
 BRAND_NAMES_FILE = os.path.join(_BASE_DIR, "brand_names.json")
 # 담당자마다 A1 셀에 브랜드명을 다르게 적어 보내는 경우, 같은 브랜드로 취급하도록 이름을 통일시켜주는 매핑
 BRAND_ALIASES_FILE = os.path.join(_BASE_DIR, "brand_aliases.json")
+# 브랜드별 가입증명서 '원본 서식' PDF 폴더. 실제로 발급된 예시 증명서를 그대로 서식으로 써서,
+# 증권번호/계약자/보험종목 등은 그 서식에 이미 올바르게 적혀 있는 값을 그대로 두고,
+# 매장마다 달라지는 5개 항목(보험기간/점포명/주소/보상한도액/보험료)만 덮어써서 새로 만듦.
+# assets/cert_templates 에 미리 등록해둔 브랜드(트레몰로/월메이드/올리비아로렌&오뷔엘알&주얼리)는
+# 코드와 함께 배포되어 재배포해도 사라지지 않음. 새 브랜드는 /setcerttemplate 로 직접 추가 가능(이땐
+# 서버 디스크에 저장되어 재배포 시 다시 등록해야 함).
+CERT_TEMPLATES_DIR = os.path.join(_BASE_DIR, "cert_templates")
+CERT_BUNDLED_TEMPLATES_DIR = os.path.join(_BASE_DIR, "assets", "cert_templates")
 
 SYSTEM_PROMPT = (
     "당신은 사용자의 개인 AI 비서입니다. 한국어로 친절하고 간결하게 답변하세요. "
@@ -129,7 +150,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/resetbrand <브랜드명> - 해당 브랜드 통합파일 삭제하고 처음부터 다시 등록\n"
         "/setbrandname <브랜드명> <표시할 이름> - 통합파일을 보내드릴 때 쓸 파일명 변경\n"
         "/sendmaster <브랜드명> - 지금 저장된 통합파일을 새로 올리지 않고 다시 받아보기\n"
-        "/setbrandalias <다르게 인식된 이름> <진짜 브랜드명> - 담당자마다 다르게 적는 브랜드명을 하나로 통일\n\n"
+        "/setbrandalias <다르게 인식된 이름> <진짜 브랜드명> - 담당자마다 다르게 적는 브랜드명을 하나로 통일\n"
+        "/setcerttemplate <브랜드명> - (예시 PDF에 답장하며 사용) 그 브랜드 전용 가입증명서 서식으로 등록\n\n"
         "길찾기는 명령어 없이 그냥 '강남역까지 얼마나 걸려?', '홍대에서 여의도까지 어떻게 가?'처럼 물어보셔도 알아들어요.\n\n"
         "새 이메일이 오면 자동으로 요약해서 알려드려요. 📬\n"
         "메일에 정산양식 엑셀이 첨부되어 있으면, 다운로드 안 하셔도 자동으로 확인해서 신규/폐점 매장을 반영하고 가입증명서와 갱신된 통합파일을 보내드려요.\n"
@@ -665,7 +687,49 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 DEFAULT_POLICY_NO = "82509565736000"
 
 
+def _cert_template_path_for_brand(brand: str) -> str:
+    """브랜드별 가입증명서 원본 서식 경로. 순서: 사용자가 /setcerttemplate로 직접 등록한 것(서버 디스크,
+    재배포시 사라짐) -> 코드에 미리 등록되어 배포되는 것(assets/cert_templates, 재배포에도 안전) ->
+    아무것도 없으면 기본(트레몰로) 서식."""
+    custom_path = os.path.join(CERT_TEMPLATES_DIR, f"{brand}.pdf")
+    if os.path.exists(custom_path):
+        return custom_path
+    bundled_path = os.path.join(CERT_BUNDLED_TEMPLATES_DIR, f"{brand}.pdf")
+    if os.path.exists(bundled_path):
+        return bundled_path
+    return CERT_TEMPLATE_PATH
+
+
+def _cert_rows_for_brand(brand: str) -> dict:
+    return CERT_ROWS_BY_BRAND.get(brand, DEFAULT_CERT_ROWS)
+
+
+def _has_cert_template(brand: str) -> bool:
+    """이 브랜드 전용 가입증명서 서식이 등록되어 있는지. 없으면 트레몰로 서식을 임시로 써서
+    계약자/증권번호 등이 실제와 다르게 나올 수 있어 사용자에게 알려줘야 함."""
+    if os.path.exists(os.path.join(CERT_TEMPLATES_DIR, f"{brand}.pdf")):
+        return True
+    if os.path.exists(os.path.join(CERT_BUNDLED_TEMPLATES_DIR, f"{brand}.pdf")):
+        return True
+    return False
+
+
+# 가입증명서용 폰트(NotoSerifKR)에 글자가 비어있는(빈 도형) 특수문자들을 폰트가
+# 지원하는 형태로 미리 바꿔줌. 안 하면 그 글자만 화면/PDF에서 통째로 빈 칸으로 사라짐.
+# (예: '계약자' 줄에 '㈜세정'처럼 회사명 앞에 동그라미 표시가 들어가는 경우)
+FONT_CHAR_FALLBACKS = {
+    "㈜": "(주)",
+}
+
+
+def _sanitize_for_font(text: str) -> str:
+    for bad, good in FONT_CHAR_FALLBACKS.items():
+        text = text.replace(bad, good)
+    return text
+
+
 def _render_text_image(text: str, font_size_pt: float):
+    text = _sanitize_for_font(text)
     px_size = int(font_size_pt * CERT_FONT_SCALE)
     font = ImageFont.truetype(CERT_FONT_PATH, px_size)
     ascent, descent = font.getmetrics()
@@ -678,9 +742,12 @@ def _render_text_image(text: str, font_size_pt: float):
     return img, img.width / CERT_FONT_SCALE, img.height / CERT_FONT_SCALE, descent / CERT_FONT_SCALE
 
 
-def _build_certificate_pdf(data: dict) -> bytes:
-    """data keys: policy_no, start_date, end_date, store_name, address,
-    stock_amt(int), facility_amt(int), premium(int)"""
+def _build_certificate_pdf(data: dict, brand: str) -> bytes:
+    """브랜드별 실제 발급 예시 증명서를 원본 서식으로 그대로 쓰고, 매장마다 달라지는 5개 항목만
+    흰색으로 덮은 뒤 새로 그려넣음. 증권번호/계약자/보험종목 등 나머지는 서식에 이미 올바르게
+    적혀 있으므로 건드리지 않음(브랜드마다 회사명 문구가 달라도 신경 쓸 필요 없음).
+    data keys: start_date, end_date, store_name, address, stock_amt(int), facility_amt(int), premium(int)"""
+    rows = _cert_rows_for_brand(brand)
     buf = io.BytesIO()
     c = pdf_canvas.Canvas(buf, pagesize=(CERT_PAGE_W, CERT_PAGE_H))
 
@@ -696,33 +763,43 @@ def _build_certificate_pdf(data: dict) -> bytes:
         baseline_y = y_of(bottom)
         c.drawImage(ImageReader(img), x0, baseline_y - descent_pt, width=w_pt, height=h_pt, mask="auto")
 
-    cover(122.7, 178.2, 190.2, x1=210)
-    draw_text(122.7, 190.15, data["policy_no"])
+    def row_bottom(top):
+        return top + 12.0
 
-    cover(122.7, 201.4, 213.4, x1=183)
-    draw_text(122.7, 213.35, data["start_date"])
-    cover(254.7, 201.4, 213.4, x1=315)
-    draw_text(254.7, 213.35, data["end_date"])
+    period_top = rows["period"]
+    period_bottom = row_bottom(period_top)
+    cover(122.7, period_top, period_bottom, x1=183)
+    draw_text(122.7, period_bottom - 0.05, data["start_date"])
+    cover(254.7, period_top, period_bottom, x1=315)
+    draw_text(254.7, period_bottom - 0.05, data["end_date"])
 
-    cover(122.7, 295.3, 307.3)
-    draw_text(122.7, 307.25, data["store_name"])
+    store_top = rows["store_name"]
+    store_bottom = row_bottom(store_top)
+    cover(122.7, store_top, store_bottom)
+    draw_text(122.7, store_bottom - 0.05, data["store_name"])
 
-    cover(122.7, 313.3, 325.3)
-    draw_text(122.7, 325.25, data["address"])
+    addr_top = rows["address"]
+    addr_bottom = row_bottom(addr_top)
+    cover(122.7, addr_top, addr_bottom)
+    draw_text(122.7, addr_bottom - 0.05, data["address"])
 
-    cover(218.7, 367.6, 379.6, x1=305)
-    draw_text(218.7, 379.55, f'{data["stock_amt"]:,}원,')
-    cover(368.8, 367.6, 379.6, x1=445)
-    draw_text(368.8, 379.55, f'{data["facility_amt"]:,}원')
+    limit_top = rows["limit"]
+    limit_bottom = row_bottom(limit_top)
+    cover(218.7, limit_top, limit_bottom, x1=305)
+    draw_text(218.7, limit_bottom - 0.05, f'{data["stock_amt"]:,}원,')
+    cover(368.8, limit_top, limit_bottom, x1=445)
+    draw_text(368.8, limit_bottom - 0.05, f'{data["facility_amt"]:,}원')
 
-    cover(122.7, 439.8, 451.8, x1=160)
-    draw_text(122.7, 451.75, f'{data["premium"]:,}')
+    premium_top = rows["premium"]
+    premium_bottom = row_bottom(premium_top)
+    cover(122.7, premium_top, premium_bottom, x1=rows.get("premium_x1", 160))
+    draw_text(122.7, premium_bottom - 0.05, f'{data["premium"]:,}')
 
     c.save()
     buf.seek(0)
 
     overlay_reader = PdfReader(buf)
-    template_reader = PdfReader(CERT_TEMPLATE_PATH)
+    template_reader = PdfReader(_cert_template_path_for_brand(brand))
     writer = PdfWriter()
     page = template_reader.pages[0]
     page.merge_page(overlay_reader.pages[0])
@@ -1156,6 +1233,49 @@ async def set_brand_alias_command(update: Update, context: ContextTypes.DEFAULT_
     await update.message.reply_text(f"✅ 앞으로 '{alias}'로 인식되는 엑셀은 '{canonical}' 통합파일로 합쳐서 처리할게요.")
 
 
+async def set_cert_template_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """새 브랜드의 실제 발급된 예시 가입증명서 PDF를 그 브랜드의 서식으로 등록.
+    사용법: 예시 PDF를 먼저 보낸 뒤, 그 PDF 메시지에 '답장(reply)'하면서 '/setcerttemplate 브랜드명'을 입력."""
+    if not is_allowed(update):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "사용법: 먼저 그 브랜드로 실제 발급된 예시 가입증명서 PDF를 보내주세요. 그 다음 그 PDF 메시지에 "
+            "답장(reply)하면서 아래처럼 입력해주세요.\n\n/setcerttemplate <브랜드명>\n예: /setcerttemplate 트레몰로\n\n"
+            "브랜드명은 /brands 로 확인되는 이름과 정확히 같아야 해요."
+        )
+        return
+    reply = update.message.reply_to_message
+    if not reply or not reply.document:
+        await update.message.reply_text(
+            "가입증명서 예시 PDF 파일에 답장(reply)하는 방식으로 이 명령어를 보내주세요.\n"
+            "(PDF를 먼저 보내고, 그 메시지를 길게 눌러 '답장'을 선택한 뒤 명령어를 입력)"
+        )
+        return
+    doc = reply.document
+    if not (doc.file_name or "").lower().endswith(".pdf"):
+        await update.message.reply_text("PDF 파일에 답장해주세요.")
+        return
+    brand = " ".join(context.args)
+    try:
+        tg_file = await doc.get_file()
+        file_bytes = bytes(await tg_file.download_as_bytearray())
+    except Exception:
+        logger.exception("가입증명서 서식 다운로드 중 오류")
+        await update.message.reply_text("파일을 받아오는 중 오류가 발생했어요. 다시 시도해주세요.")
+        return
+    os.makedirs(CERT_TEMPLATES_DIR, exist_ok=True)
+    with open(os.path.join(CERT_TEMPLATES_DIR, f"{brand}.pdf"), "wb") as f:
+        f.write(file_bytes)
+    await update.message.reply_text(
+        f"✅ '{brand}' 가입증명서 서식으로 등록했어요. 이제부터 이 브랜드는 이 서식을 기준으로, "
+        "보험기간/점포명/주소/보상한도액/보험료만 바뀌어서 인증서가 나가요.\n\n"
+        "⚠️ 다만 이 서식은 트레몰로 서식과 항목 위치가 조금 다를 수 있어서 값이 살짝 어긋나 보일 수 있어요. "
+        "그런 경우 알려주시면 위치를 정확히 맞춰서 코드에 반영해드릴게요.\n"
+        "또한 이 서식은 재배포하면 사라지니, 재배포 후에는 다시 등록해주셔야 해요."
+    )
+
+
 async def list_brands_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_allowed(update):
         return
@@ -1352,6 +1472,7 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
         "closed_count": closed_count,
         "master_bytes": master_bytes,
         "has_policy_no": bool(policy_no),
+        "has_cert_template": _has_cert_template(brand),
     }
 
 
@@ -1385,15 +1506,19 @@ async def _sync_and_notify(bot, chat_id: int, file_bytes: bytes) -> dict | None:
         await bot.send_message(chat_id=chat_id, text=f"'{brand}' 기준으로 새로운 신규/폐점 매장이 없어요.")
         return result
 
-    if not result.get("has_policy_no"):
+    if not result.get("has_cert_template"):
         await bot.send_message(
             chat_id=chat_id,
-            text=f"⚠️ '{brand}'의 증권번호가 등록되어 있지 않아 기본 증권번호로 가입증명서를 만들어요.",
+            text=(
+                f"⚠️ '{brand}'의 가입증명서 서식이 아직 등록되어 있지 않아, 다른 브랜드 서식으로 임시로 만들어요. "
+                "증권번호/계약자 등이 실제와 다를 수 있어요. 이 브랜드로 실제 발급된 예시 인증서를 보내주시면 "
+                "전용 서식으로 등록해드릴게요."
+            ),
         )
 
     for store in result["new_stores"]:
         try:
-            pdf_bytes = _build_certificate_pdf(store)
+            pdf_bytes = _build_certificate_pdf(store, brand)
         except Exception:
             logger.exception("가입증명서 생성 중 오류")
             await bot.send_message(chat_id=chat_id, text=f"⚠️ '{store['store_name']}' 가입증명서 생성에 실패했어요.")
@@ -1830,6 +1955,7 @@ def main() -> None:
     app.add_handler(CommandHandler("setbrandname", set_brand_name_command))
     app.add_handler(CommandHandler("sendmaster", send_master_command))
     app.add_handler(CommandHandler("setbrandalias", set_brand_alias_command))
+    app.add_handler(CommandHandler("setcerttemplate", set_cert_template_command))
     app.add_handler(MessageHandler(filters.LOCATION, handle_location))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
