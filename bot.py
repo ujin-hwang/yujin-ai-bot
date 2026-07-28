@@ -817,12 +817,32 @@ def _build_certificate_pdf(data: dict, brand: str) -> bytes:
     cover(122.7, addr_top, addr_bottom)
     draw_text(122.7, addr_bottom - 0.05, data["address"])
 
+    # 재물부문(재고/시설비품/건물) 항목별로, 정산양식에 금액이 기재된 항목만 골라서 나열함
+    # (예: 건물 값이 없으면 '건물' 자체를 언급하지 않고 재고/시설비품만 표시). 셋 다 없으면
+    # '보상한도액' 줄 자체를(라벨 포함) 지움.
     limit_top = rows["limit"]
     limit_bottom = row_bottom(limit_top)
-    cover(218.7, limit_top, limit_bottom, x1=305)
-    draw_text(218.7, limit_bottom - 0.05, f'{data["stock_amt"]:,}원,')
-    cover(368.8, limit_top, limit_bottom, x1=445)
-    draw_text(368.8, limit_bottom - 0.05, f'{data["facility_amt"]:,}원')
+    property_items = []
+    if data.get("stock_amt", 0):
+        property_items.append(f'재고 {data["stock_amt"]:,}원')
+    if data.get("facility_amt", 0):
+        property_items.append(f'시설/비품 {data["facility_amt"]:,}원')
+    if data.get("building_amt", 0):
+        property_items.append(f'건물 {data["building_amt"]:,}원')
+    if property_items:
+        cover(188.7, limit_top, limit_bottom)  # '재고'/'시설/비품' 등 기존 라벨+금액을 통째로 지우고
+        draw_text(188.7, limit_bottom - 0.05, ", ".join(property_items))  # 있는 항목만 새로 나열
+    else:
+        cover(56.7, limit_top, limit_bottom)  # '보상한도액 :' 라벨까지 통째로 지움
+
+    # 영업배상 부문(평수 기준 산정)이 정산양식에 기재 안 돼있으면, 서식에 고정으로 박혀 있는
+    # '배상부문 ...' / '구내치료비 ...' 두 줄을 흰색으로 지움(이 두 줄은 모든 브랜드가 항상
+    # 재물부문 줄에서 정확히 +18pt, +36pt 아래에 있어서 좌표를 새로 재지 않아도 계산 가능함).
+    if not data.get("has_liability", True):
+        liability_row1 = limit_top + 18.0
+        liability_row2 = limit_top + 36.3
+        cover(122.7, liability_row1, liability_row1 + 18.3)
+        cover(122.7, liability_row2, liability_row2 + 18.3)
 
     premium_top = rows["premium"]
     premium_bottom = row_bottom(premium_top)
@@ -1150,10 +1170,15 @@ def _compute_new_store_cert_values(vals: dict, rate1_pct: float, rate2: float) -
     return {
         "stock_amt": int(stock),
         "facility_amt": int(facility),
+        "building_amt": int(building),
         "premium": round(premium),
         "start_date": start_d.strftime("%Y.%m.%d") if start_d else str(start or ""),
         "start_date_yymmdd": start_d.strftime("%y%m%d") if start_d else "",
         "end_date": end_d.strftime("%Y.%m.%d") if end_d else str(end or ""),
+        # 재고/시설비품/건물 중 하나라도 기재돼 있으면 재물부문 있음, 평수가 기재돼 있으면 영업배상 부문 있음.
+        # 둘 다 없으면 가입증명서에서 해당 줄 자체를 지워야 함(사용자 요청).
+        "has_property": bool(stock or facility or building),
+        "has_liability": bool(pyeong),
     }
 
 
