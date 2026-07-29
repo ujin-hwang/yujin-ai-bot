@@ -1468,6 +1468,10 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
 
             cert_vals = _compute_new_store_cert_values(vals, rate1, rate2)
             address = str(vals.get("매장주소") or "").strip()
+            # 엑셀 매장주소가 "...52\n(백화점내)"처럼 줄바꿈으로 나뉘어 있는 경우가 있는데,
+            # 그대로 두면 가입증명서에 한 줄만 그려서 괄호 부분이 아예 안 보이게 됨(PDF 렌더링이
+            # 한 줄짜리로만 처리됨). 줄바꿈을 공백으로 바꿔서 괄호 내용까지 한 줄로 전부 표시함.
+            address = re.sub(r"\s*\n\s*", " ", address)
             address = re.sub(r"(?<=\S)\(", " (", address)
             new_stores.append({
                 "policy_no": policy_no or DEFAULT_POLICY_NO,
