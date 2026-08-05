@@ -57,12 +57,18 @@ KAKAO_REST_API_KEY = os.environ.get("KAKAO_REST_API_KEY")
 
 client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# 집/회사 등 저장된 위치를 담아두는 파일 (재시작해도 남아있도록 디스크에 저장)
-PLACES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "places.json")
-
 # 가입증명서 자동 생성용 자산(폰트/템플릿) 경로
 # assets 폴더가 있으면 그 안에서, 없으면(루트에 바로 올린 경우) bot.py와 같은 위치에서 찾음
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# 통합파일/증권번호/브랜드 설정처럼 "재배포해도 사라지면 안 되는" 데이터를 저장할 위치.
+# Render에서 영구 디스크(Persistent Disk)를 만들어 PERSIST_DIR 환경변수로 그 마운트 경로를
+# 지정해두면 그쪽에 저장하고, 설정 안 해두면(기본값) 지금처럼 코드 폴더에 저장함(재배포시 초기화).
+PERSIST_DIR = os.environ.get("PERSIST_DIR", _BASE_DIR)
+os.makedirs(PERSIST_DIR, exist_ok=True)
+
+# 집/회사 등 저장된 위치를 담아두는 파일 (재시작해도 남아있도록 디스크에 저장)
+PLACES_FILE = os.path.join(PERSIST_DIR, "places.json")
 
 
 def _find_asset(filename: str) -> str:
@@ -106,20 +112,21 @@ CERT_ROWS_BY_BRAND = {
 }
 
 # 브랜드별 정산 통합파일을 서버에 계속 보관/갱신하는 폴더
-MASTERS_DIR = os.path.join(_BASE_DIR, "masters")
+MASTERS_DIR = os.path.join(PERSIST_DIR, "masters")
 # 브랜드별 증권번호를 저장해두는 파일 (파일명에서 못 찾을 때 사용)
-POLICY_NUMBERS_FILE = os.path.join(_BASE_DIR, "policy_numbers.json")
+POLICY_NUMBERS_FILE = os.path.join(PERSIST_DIR, "policy_numbers.json")
 # 브랜드별로 파일을 보내드릴 때 쓸 표시용 파일명(엑셀 A1 셀 이름과 다르게 쓰고 싶을 때)
-BRAND_NAMES_FILE = os.path.join(_BASE_DIR, "brand_names.json")
+BRAND_NAMES_FILE = os.path.join(PERSIST_DIR, "brand_names.json")
 # 담당자마다 A1 셀에 브랜드명을 다르게 적어 보내는 경우, 같은 브랜드로 취급하도록 이름을 통일시켜주는 매핑
-BRAND_ALIASES_FILE = os.path.join(_BASE_DIR, "brand_aliases.json")
+BRAND_ALIASES_FILE = os.path.join(PERSIST_DIR, "brand_aliases.json")
 # 브랜드별 가입증명서 '원본 서식' PDF 폴더. 실제로 발급된 예시 증명서를 그대로 서식으로 써서,
 # 증권번호/계약자/보험종목 등은 그 서식에 이미 올바르게 적혀 있는 값을 그대로 두고,
 # 매장마다 달라지는 5개 항목(보험기간/점포명/주소/보상한도액/보험료)만 덮어써서 새로 만듦.
 # assets/cert_templates 에 미리 등록해둔 브랜드(트레몰로/월메이드/올리비아로렌&오뷔엘알&주얼리)는
 # 코드와 함께 배포되어 재배포해도 사라지지 않음. 새 브랜드는 /setcerttemplate 로 직접 추가 가능(이땐
-# 서버 디스크에 저장되어 재배포 시 다시 등록해야 함).
-CERT_TEMPLATES_DIR = os.path.join(_BASE_DIR, "cert_templates")
+# 서버 디스크에 저장되어 재배포 시 다시 등록해야 함). /setcerttemplate로 등록한 서식은
+# PERSIST_DIR(영구 디스크)에 저장해서 재배포해도 남아있게 함.
+CERT_TEMPLATES_DIR = os.path.join(PERSIST_DIR, "cert_templates")
 CERT_BUNDLED_TEMPLATES_DIR = os.path.join(_BASE_DIR, "assets", "cert_templates")
 
 SYSTEM_PROMPT = (
@@ -917,18 +924,48 @@ def _build_header_map(ws) -> tuple[dict, int]:
     return header_map, sub_row + 1
 
 
-def _row_values(ws, header_map: dict, r: int) -> dict:
+_SIMPLE_REF_RE = re.compile(r"^=([^!]+)!(\$?[A-Z]+\$?\d+)$")
+
+
+def _resolve_simple_formula(formula, wb_values):
+    """'=최초가입전체리스트!E108'처럼 다른 시트의 셀 하나를 그대로 참조하는 단순 수식이면,
+    그 시트의 실제 값을 대신 찾아서 반환함. 매장명 칸이 이런 수식으로 돼 있는 폐점매장 행이
+    있는데, 파일이 한 번도 진짜 엑셀에서 재계산/저장된 적이 없으면 캐시된 값이 없어서
+    data_only=True로 읽어도 매장명이 빈 값(None)으로 나옴 -> 중복 확인(dedup)이
+    그 행을 못 찾아서 같은 매장이 두 번 추가되는 버그로 이어짐. 이걸 막기 위한 보강."""
+    if not isinstance(formula, str) or not formula.startswith("="):
+        return None
+    m = _SIMPLE_REF_RE.match(formula.strip())
+    if not m:
+        return None
+    sheet_name = m.group(1).strip().strip("'")
+    cell_ref = m.group(2).replace("$", "")
+    if sheet_name not in wb_values.sheetnames:
+        return None
+    try:
+        return wb_values[sheet_name][cell_ref].value
+    except Exception:
+        return None
+
+
+def _row_values(ws, header_map: dict, r: int, formula_ws=None, wb_values=None) -> dict:
     row_cells = ws[r]
+    formula_cells = formula_ws[r] if formula_ws is not None else None
     vals = {}
     for key, idx in header_map.items():
-        vals[key] = row_cells[idx].value if idx < len(row_cells) else None
+        v = row_cells[idx].value if idx < len(row_cells) else None
+        if v is None and formula_cells is not None and wb_values is not None and idx < len(formula_cells):
+            resolved = _resolve_simple_formula(formula_cells[idx].value, wb_values)
+            if resolved is not None:
+                v = resolved
+        vals[key] = v
     return vals
 
 
-def _extract_data_rows(ws, header_map: dict, min_row: int) -> list:
+def _extract_data_rows(ws, header_map: dict, min_row: int, formula_ws=None, wb_values=None) -> list:
     out = []
     for r in range(min_row, ws.max_row + 1):
-        vals = _row_values(ws, header_map, r)
+        vals = _row_values(ws, header_map, r, formula_ws, wb_values)
         if not vals.get("매장명"):
             continue
         vals["_excel_row"] = r
@@ -1028,6 +1065,11 @@ def _find_template_row(ws, header_map: dict, min_row: int, target_row: int) -> i
 YELLOW_FILL = PatternFill(start_color="FFFFFF00", end_color="FFFFFF00", fill_type="solid")
 NO_FILL = PatternFill(fill_type=None)
 
+# 통합파일에 새로 써넣는 날짜 칸들. 담당자가 접수일자를 '26.07.16'처럼 문자로 직접 타이핑해서
+# 보내는 경우가 있어서, 그대로 쓰면 셀마다 표기 형식이 제각각이 됨. 항상 0000-00-00 형식으로
+# 통일해서 보이도록, 실제 날짜값으로 바꿔서 쓰고 셀 서식도 맞춰줌.
+DATE_FIELDS = {"접수일자", "보험시작일", "보험종기일", "폐점일"}
+
 
 def _write_row(ws, header_map: dict, target_row: int, values: dict, template_row: int) -> None:
     """각 컬럼마다 '기준 행(template_row)'의 셀이 수식이면 그 수식을 target_row로 복사(번역)하고,
@@ -1055,7 +1097,13 @@ def _write_row(ws, header_map: dict, target_row: int, values: dict, template_row
             continue
 
         if key in values and values[key] not in (None, ""):
-            target_cell.value = values[key]
+            v = values[key]
+            if key in DATE_FIELDS:
+                parsed = _parse_date_val(v)
+                if parsed is not None:
+                    v = parsed
+                    target_cell.number_format = "yyyy-mm-dd"
+            target_cell.value = v
 
     # 새로 만든 행(기존 서식 범위를 벗어난 경우)엔 순번을 이어서 채워줌
     if target_row != template_row:
@@ -1452,7 +1500,13 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
         master_header, master_min_row = _build_header_map(master_ws)
         if not input_header or not master_header:
             continue
-        existing_keys = {_dedup_key(v) for v in _extract_data_rows(master_ws_values, master_header, master_min_row)}
+        existing_keys = {
+            _dedup_key(v)
+            for v in _extract_data_rows(
+                master_ws_values, master_header, master_min_row,
+                formula_ws=master_ws, wb_values=master_wb_values,
+            )
+        }
         rate1 = _extract_rate(master_ws, master_header, "연간재물보험료", r"\*([\d.]+)%", 0.0665, master_min_row)
         rate2 = _extract_rate(master_ws, master_header, "연간영업배상보험료", r"\*([\d.]+)", 1793, master_min_row)
 
@@ -1494,7 +1548,13 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
         master_header, master_min_row = _build_header_map(master_ws)
         if not input_header or not master_header:
             continue
-        existing_keys = {_dedup_key(v) for v in _extract_data_rows(master_ws_values, master_header, master_min_row)}
+        existing_keys = {
+            _dedup_key(v)
+            for v in _extract_data_rows(
+                master_ws_values, master_header, master_min_row,
+                formula_ws=master_ws, wb_values=master_wb_values,
+            )
+        }
 
         for vals in _extract_data_rows(input_ws, input_header, input_min_row):
             key = _dedup_key(vals)
