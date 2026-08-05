@@ -1038,15 +1038,18 @@ SKIP_WRITE_FIELDS = {"월별", "순번"}
 
 
 def _find_target_row(ws, header_map: dict, min_row: int) -> int:
-    """매장명이 비어있는 첫 번째(수식이 이미 준비된) 행을 찾음. 없으면 max_row+1"""
+    """실제 데이터(매장명)가 채워진 가장 마지막 행 바로 다음 행을 찾음. 새 매장은 항상 접수
+    순서대로 맨 아래에 쌓여야 하므로, 중간에 (예전에 지워졌거나 서식만 남은) 빈 행이 있어도
+    거기 끼워넣지 않고 항상 전체에서 가장 마지막에 채워진 행 다음에 추가함."""
     name_idx = header_map.get("매장명")
     if name_idx is None:
         return ws.max_row + 1
+    last_filled = min_row - 1
     for r in range(min_row, ws.max_row + 1):
         row_cells = ws[r]
-        if name_idx >= len(row_cells) or not row_cells[name_idx].value:
-            return r
-    return ws.max_row + 1
+        if name_idx < len(row_cells) and row_cells[name_idx].value:
+            last_filled = r
+    return last_filled + 1
 
 
 def _find_template_row(ws, header_map: dict, min_row: int, target_row: int) -> int:
