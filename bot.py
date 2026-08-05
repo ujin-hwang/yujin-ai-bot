@@ -1157,6 +1157,23 @@ def _parse_date_val(date_val) -> dt.date | None:
     return None
 
 
+def _is_stale_recv_date(vals: dict, period_start: dt.date) -> str | None:
+    """담당자가 보내는 정산엑셀에는 이번에 새로 접수된 건뿐 아니라 그동안의 전체 이력이 통째로
+    들어있는 경우가 많음. 그중 매장코드가 통합파일에 없는 행은 규칙상 '신규'로 처리하지만,
+    접수일자가 지난 정산기간보다도 훨씬 이전(한 기간 이상 전)이면 사실은 예전에 이미 다른 방식으로
+    처리된 건이 파일에만 남아있는 것일 수 있음. 이런 경우를 조용히 신규 처리하지 말고 사용자에게
+    표시해서 실수로 잘못 등록되는 걸 막기 위한 확인용 함수. 오래된 날짜면 'YYYY-MM-DD' 문자열을,
+    아니면 None을 반환함."""
+    recv = vals.get("접수일자") or vals.get("보험시작일")
+    d = _parse_date_val(recv)
+    if d is None:
+        return None
+    threshold = period_start - dt.timedelta(days=31)
+    if d < threshold:
+        return d.isoformat()
+    return None
+
+
 def _recolor_by_period(ws, header_map: dict, min_row: int, period_start: dt.date, period_end: dt.date) -> None:
     """접수일자가 이번 정산 기간(16일~다음달 15일) 안이면 노란색, 기간이 지난 항목이면 다시
     흰색(음영 없음)으로 되돌림. 월별/순번 칸은 그대로 둠. 신규매장/폐점매장 시트 양쪽 다 이 규칙을
@@ -1487,6 +1504,9 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
     policy_numbers = _load_policy_numbers()
     policy_no = policy_numbers.get(brand, "")
 
+    # 오래된 접수일자인 '신규' 건을 나중에 알림으로 표시하기 위해 미리 계산해둠
+    period_start, _period_end_unused = _current_period()
+
     new_stores = []
     closed_count = 0
 
@@ -1535,6 +1555,7 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
                 "store_code": str(vals.get("매장코드") or "").strip(),
                 "store_name": str(vals.get("매장명") or "").strip(),
                 "address": address,
+                "stale_recv_date": _is_stale_recv_date(vals, period_start),
                 **cert_vals,
             })
 
@@ -1650,7 +1671,7 @@ async def _sync_and_notify(bot, chat_id: int, file_bytes: bytes) -> dict | None:
             await bot.send_message(chat_id=chat_id, text=f"⚠️ '{store['store_name']}' 가입증명서 생성에 실패했어요.")
             continue
 
-        out_name = f"{store['store_name']}_{store['store_code']}_{store['start_date_yymmdd']}.pdf"
+        out_name = f"{store['store_code']}_{store['store_name']}_{store['start_date_yymmdd']}.pdf"
         await bot.send_document(
             chat_id=chat_id,
             document=io.BytesIO(pdf_bytes),
@@ -1662,6 +1683,25 @@ async def _sync_and_notify(bot, chat_id: int, file_bytes: bytes) -> dict | None:
     if result["closed_count"]:
         summary += f", 폐점 매장 {result['closed_count']}곳"
     await bot.send_message(chat_id=chat_id, text=summary)
+
+    # 담당자가 보낸 파일에 전체 이력이 섞여 있어서, 접수일자가 아주 오래된(지난 정산기간보다도
+    # 이전) 매장이 '신규'로 잡힌 경우 - 이미 예전에 다른 방식으로 처리된 건일 수 있으니 등록/증명서
+    # 발급은 그대로 진행하되, 놓치지 않도록 별도로 알려드림 (조용히 신규 처리만 하면 나중에 실수로
+    # 발견하게 됨)
+    stale_stores = [s for s in result["new_stores"] if s.get("stale_recv_date")]
+    if stale_stores:
+        lines = "\n".join(
+            f"- {s['store_name']}({s['store_code']}) 접수일자 {s['stale_recv_date']}"
+            for s in stale_stores
+        )
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⚠️ 아래 매장은 접수일자가 지난 정산기간보다도 오래돼서, 이미 예전에 처리됐는데 "
+                "파일에만 이력으로 남아있던 건일 수 있어요. 확인해주세요(맞으면 그냥 두시면 되고, "
+                "이미 처리된 거면 알려주시면 통합파일에서 빼드릴게요).\n" + lines
+            ),
+        )
 
     if result.get("master_bytes"):
         display_name = _display_name(brand)
