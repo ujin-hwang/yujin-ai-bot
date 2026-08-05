@@ -897,6 +897,18 @@ def _find_header_row(ws, search_upto: int = 6) -> int | None:
     return None
 
 
+_STORE_CODE_RE = re.compile(r"^[A-Za-z]{2,4}\d{2,5}[A-Za-z]?$")
+_KOREAN_RE = re.compile(r"[가-힣]")
+
+
+def _looks_like_store_code(v) -> bool:
+    return bool(_STORE_CODE_RE.match(str(v).strip()))
+
+
+def _looks_like_korean_text(v) -> bool:
+    return bool(_KOREAN_RE.search(str(v)))
+
+
 def _build_header_map(ws) -> tuple[dict, int]:
     """헤더 행을 자동으로 찾아 '정규화된 헤더명 -> 0-based 컬럼 인덱스' 매핑과 데이터 시작 행을 반환.
     '매장명' 등 주요 라벨이 있는 행(main_row) 바로 아래 행에 병합된 그룹(재물부문 등)의
@@ -921,7 +933,32 @@ def _build_header_map(ws) -> tuple[dict, int]:
         norm = _norm_header(label)
         if norm and norm not in header_map:
             header_map[norm] = idx
-    return header_map, sub_row + 1
+
+    data_start = sub_row + 1
+
+    # 일부 브랜드의 '상설' 시트처럼, 헤더 글자는 '매장명'/'매장코드' 순서대로 적혀 있는데
+    # 실제 데이터는 그 반대로 입력돼 있는 경우가 실제로 있었음(담당자 쪽 서식 실수). 이걸 그대로
+    # 믿으면 가입증명서에 매장코드와 매장명이 뒤바뀌어 나가는 심각한 오류로 이어지므로, 실제
+    # 데이터 몇 줄의 값 형태(코드형 vs 한글명)를 보고 뒤바뀐 게 확실하면 자동으로 바로잡음.
+    name_idx = header_map.get("매장명")
+    code_idx = header_map.get("매장코드")
+    if name_idx is not None and code_idx is not None and name_idx != code_idx:
+        checked = 0
+        swapped_looking = 0
+        for r in range(data_start, min(ws.max_row, data_start + 30) + 1):
+            name_val = ws.cell(row=r, column=name_idx + 1).value
+            code_val = ws.cell(row=r, column=code_idx + 1).value
+            if not name_val or not code_val:
+                continue
+            checked += 1
+            if _looks_like_store_code(name_val) and _looks_like_korean_text(code_val):
+                swapped_looking += 1
+            if checked >= 5:
+                break
+        if checked and swapped_looking == checked:
+            header_map["매장명"], header_map["매장코드"] = code_idx, name_idx
+
+    return header_map, data_start
 
 
 _SIMPLE_REF_RE = re.compile(r"^=([^!]+)!(\$?[A-Z]+\$?\d+)$")
@@ -1247,6 +1284,9 @@ def _compute_new_store_cert_values(vals: dict, rate1_pct: float, rate2: float) -
         # 둘 다 없으면 가입증명서에서 해당 줄 자체를 지워야 함(사용자 요청).
         "has_property": bool(stock or facility or building),
         "has_liability": bool(pyeong),
+        # 보험종기일이 이미 지난(오늘 이전) 건은 통합파일엔 기록해두되, 가입증명서는 만들 필요
+        # 없음(사용자 요청) - 예: 뒤늦게 딸려온, 이미 끝난 단기 행사장 계약 등
+        "period_ended": bool(end_d and end_d.date() < dt.date.today()),
     }
 
 
@@ -1514,6 +1554,25 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
     master_new_sheets = _find_type_sheets(master_wb, "신규매장")
     master_new_sheets_values = _find_type_sheets(master_wb_values, "신규매장")
 
+    # 담당자가 보내는 개별 신청서는 '신규매장(정상)/신규매장(상설)' 구분 없이 그냥 '신규매장'
+    # 하나로만 오는 경우가 많아서(_find_type_sheets 설명 참고), 이때는 일단 '정상'으로 간주해서
+    # 비교함. 그런데 그 안에 사실은 이미 '상설' 쪽에 등록된 매장이 섞여 들어오면, '정상' 쪽
+    # 기존 목록에는 없으니 신규로 잘못 잡혀서 똑같은 매장이 중복 등록되는 사고가 남. 이를 막기
+    # 위해 어떤 서브타입을 처리하든 정상/상설 등 모든 서브타입에 이미 등록된 매장 전체를 합쳐서
+    # 중복 여부를 확인함(실제로 새 행을 쓰는 시트는 여전히 해당 서브타입 시트 하나뿐).
+    all_new_existing_keys = set()
+    for _st, _mws in master_new_sheets.items():
+        _mws_values = master_new_sheets_values.get(_st)
+        if _mws_values is None:
+            continue
+        _h, _mr = _build_header_map(_mws)
+        if not _h:
+            continue
+        all_new_existing_keys |= {
+            _dedup_key(v)
+            for v in _extract_data_rows(_mws_values, _h, _mr, formula_ws=_mws, wb_values=master_wb_values)
+        }
+
     for sub_type, input_ws in input_new_sheets.items():
         master_ws = master_new_sheets.get(sub_type)
         master_ws_values = master_new_sheets_values.get(sub_type)
@@ -1523,13 +1582,7 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
         master_header, master_min_row = _build_header_map(master_ws)
         if not input_header or not master_header:
             continue
-        existing_keys = {
-            _dedup_key(v)
-            for v in _extract_data_rows(
-                master_ws_values, master_header, master_min_row,
-                formula_ws=master_ws, wb_values=master_wb_values,
-            )
-        }
+        existing_keys = set(all_new_existing_keys)
         rate1 = _extract_rate(master_ws, master_header, "연간재물보험료", r"\*([\d.]+)%", 0.0665, master_min_row)
         rate2 = _extract_rate(master_ws, master_header, "연간영업배상보험료", r"\*([\d.]+)", 1793, master_min_row)
 
@@ -1538,6 +1591,15 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
             if key in existing_keys:
                 continue
             existing_keys.add(key)
+
+            # 오래된 접수일자 경고는 정산파일에 실제로 적혀 있던 원래 접수일자 기준으로
+            # 판단해야 하므로, 접수일자를 오늘 날짜로 덮어쓰기 전에 미리 계산해둠
+            stale_recv_date = _is_stale_recv_date(vals, period_start)
+
+            # 접수일자는 정산파일/메일에 뭐라고 적혀 있든, 실제로 봇이 이 건을 처리한 날짜
+            # (메일이 온 날 또는 정산파일을 텔레그램에 업로드한 날)로 통일해서 통합파일에 기록함
+            vals = dict(vals)
+            vals["접수일자"] = dt.date.today()
 
             target_row = _find_target_row(master_ws, master_header, master_min_row)
             template_row = _find_template_row(master_ws, master_header, master_min_row, target_row)
@@ -1555,13 +1617,27 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
                 "store_code": str(vals.get("매장코드") or "").strip(),
                 "store_name": str(vals.get("매장명") or "").strip(),
                 "address": address,
-                "stale_recv_date": _is_stale_recv_date(vals, period_start),
+                "stale_recv_date": stale_recv_date,
                 **cert_vals,
             })
 
     input_closed_sheets = _find_type_sheets(input_wb, "폐점매장")
     master_closed_sheets = _find_type_sheets(master_wb, "폐점매장")
     master_closed_sheets_values = _find_type_sheets(master_wb_values, "폐점매장")
+
+    # 신규매장과 마찬가지로, 정상/상설 등 모든 서브타입에 이미 등록된 폐점매장을 합쳐서 중복 검사함
+    all_closed_existing_keys = set()
+    for _st, _mws in master_closed_sheets.items():
+        _mws_values = master_closed_sheets_values.get(_st)
+        if _mws_values is None:
+            continue
+        _h, _mr = _build_header_map(_mws)
+        if not _h:
+            continue
+        all_closed_existing_keys |= {
+            _dedup_key(v)
+            for v in _extract_data_rows(_mws_values, _h, _mr, formula_ws=_mws, wb_values=master_wb_values)
+        }
 
     for sub_type, input_ws in input_closed_sheets.items():
         master_ws = master_closed_sheets.get(sub_type)
@@ -1572,19 +1648,17 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
         master_header, master_min_row = _build_header_map(master_ws)
         if not input_header or not master_header:
             continue
-        existing_keys = {
-            _dedup_key(v)
-            for v in _extract_data_rows(
-                master_ws_values, master_header, master_min_row,
-                formula_ws=master_ws, wb_values=master_wb_values,
-            )
-        }
+        existing_keys = set(all_closed_existing_keys)
 
         for vals in _extract_data_rows(input_ws, input_header, input_min_row):
             key = _dedup_key(vals)
             if key in existing_keys:
                 continue
             existing_keys.add(key)
+
+            # 폐점매장도 마찬가지로 접수일자를 실제 처리일(오늘)로 통일해서 기록함
+            vals = dict(vals)
+            vals["접수일자"] = dt.date.today()
 
             target_row = _find_target_row(master_ws, master_header, master_min_row)
             template_row = _find_template_row(master_ws, master_header, master_min_row, target_row)
@@ -1663,7 +1737,12 @@ async def _sync_and_notify(bot, chat_id: int, file_bytes: bytes) -> dict | None:
             ),
         )
 
+    ended_stores = []
     for store in result["new_stores"]:
+        # 보험종기일이 이미 지난 건은 통합파일엔 기록해두되, 가입증명서는 만들지 않음(사용자 요청)
+        if store.get("period_ended"):
+            ended_stores.append(store)
+            continue
         try:
             pdf_bytes = _build_certificate_pdf(store, brand)
         except Exception:
@@ -1677,6 +1756,16 @@ async def _sync_and_notify(bot, chat_id: int, file_bytes: bytes) -> dict | None:
             document=io.BytesIO(pdf_bytes),
             filename=out_name,
             caption=f"📄 {store['store_name']} 가입증명서",
+        )
+
+    if ended_stores:
+        lines = "\n".join(f"- {s['store_name']}({s['store_code']}) 종기일 {s['end_date']}" for s in ended_stores)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "ℹ️ 아래 매장은 보험종기일이 이미 지나서 통합파일에는 등록했지만 가입증명서는 만들지 않았어요.\n"
+                + lines
+            ),
         )
 
     summary = f"✅ '{brand}' 통합파일을 갱신했어요.\n신규 매장 {len(result['new_stores'])}곳"
