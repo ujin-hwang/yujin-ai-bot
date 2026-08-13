@@ -1031,13 +1031,20 @@ def _dedup_key(vals: dict) -> tuple:
 
 
 def _get_brand_name(wb) -> str | None:
-    """첫 시트 A1 셀이 '*. 브랜드명' 형식이면 브랜드명을 반환"""
+    """첫 시트에서 '*. 브랜드명' 형식의 셀을 찾아 브랜드명을 반환.
+    보통 A1 셀에 있지만, 담당자마다 앞에 빈 열을 하나 더 두는 등 서식이 조금씩 달라서
+    B1처럼 다른 칸에 적혀 있는 경우도 실제로 있었음. 그래서 A1만 보지 않고 첫 시트의
+    맨 위 몇 행/열을 넓게 훑어서 '*.'로 시작하는 칸을 찾음."""
     ws = wb.worksheets[0]
-    a1 = ws["A1"].value
-    if not a1:
-        return None
-    m = re.match(r"\*\.\s*(.+)", str(a1).strip())
-    return m.group(1).strip() if m else None
+    for row in ws.iter_rows(min_row=1, max_row=3, max_col=6):
+        for cell in row:
+            v = cell.value
+            if not v:
+                continue
+            m = re.match(r"\*\.\s*(.+)", str(v).strip())
+            if m:
+                return m.group(1).strip()
+    return None
 
 
 def _find_type_sheets(wb, keyword: str) -> dict:
