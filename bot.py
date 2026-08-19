@@ -1363,10 +1363,18 @@ def _is_stale_recv_date(vals: dict, period_start: dt.date) -> str | None:
     return None
 
 
+# 음영(fill) 처리에서만 예외로 둘 칸. 값은 절대 건드리면 안 되는 '월별'(정산기간 라벨, 여러
+# 행에 병합돼 있어 그 블록 전체를 대표하는 텍스트라 행 단위로 색칠하면 오히려 어색함)만 제외하고,
+# '순번'은 _write_row에서는 값을 안 건드릴 뿐 음영까지 뺄 이유는 없음 - 예전엔 SKIP_WRITE_FIELDS를
+# 그대로 재사용해서 순번 칸 음영이 기간이 지나도 노란색으로 남아있는 버그가 있었음.
+SKIP_FILL_FIELDS = {"월별"}
+
+
 def _recolor_by_period(ws, header_map: dict, min_row: int, period_start: dt.date, period_end: dt.date) -> None:
     """접수일자가 이번 정산 기간(16일~다음달 15일) 안이면 노란색, 기간이 지난 항목이면 다시
-    흰색(음영 없음)으로 되돌림. 월별/순번 칸은 그대로 둠. 신규매장/폐점매장 시트 양쪽 다 이 규칙을
-    적용해서, 이번 달에 새로 들어온 신규/폐점 매장을 한눈에 볼 수 있게 함."""
+    흰색(음영 없음)으로 되돌림. 월별 칸(정산기간 라벨)만 그대로 두고, 순번을 포함한 나머지
+    칸은 전부 같이 칠함. 신규매장/폐점매장 시트 양쪽 다 이 규칙을 적용해서, 이번 달에 새로
+    들어온 신규/폐점 매장을 한눈에 볼 수 있게 함."""
     date_idx = header_map.get("접수일자")
     name_idx = header_map.get("매장명")
     if date_idx is None or name_idx is None:
@@ -1380,7 +1388,7 @@ def _recolor_by_period(ws, header_map: dict, min_row: int, period_start: dt.date
         in_period = row_date is not None and period_start <= row_date <= period_end
         fill = YELLOW_FILL if in_period else NO_FILL
         for key, idx in header_map.items():
-            if key in SKIP_WRITE_FIELDS:
+            if key in SKIP_FILL_FIELDS:
                 continue
             cell = ws.cell(row=r, column=idx + 1)
             if isinstance(cell, MergedCell):
