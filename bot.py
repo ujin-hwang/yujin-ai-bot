@@ -2,6 +2,7 @@ import os
 import io
 import re
 import json
+import copy
 import asyncio
 import datetime as dt
 import logging
@@ -1180,6 +1181,150 @@ def _current_period(today: dt.date | None = None) -> tuple[dt.date, dt.date]:
     return start, end
 
 
+def _format_period_label(period_start: dt.date, period_end: dt.date) -> str:
+    """정산기간을 통합파일에 실제로 쓰여있는 '26년\\n7월16일~\\n8월15일' 형식의 라벨 문자열로
+    만듦. 연도가 바뀌는 기간(예: 12월16일~1월15일)은 두 연도를 다 표시함."""
+    start_yy = str(period_start.year)[2:]
+    if period_start.year == period_end.year:
+        return f"{start_yy}년\n{period_start.month}월{period_start.day}일~\n{period_end.month}월{period_end.day}일"
+    end_yy = str(period_end.year)[2:]
+    return (
+        f"{start_yy}년\n{period_start.month}월{period_start.day}일~\n"
+        f"{end_yy}년\n{period_end.month}월{period_end.day}일"
+    )
+
+
+def _col_a_label_blocks(ws) -> list[tuple[str, int, int]]:
+    """컬럼 A(월별)에 있는 정산기간 라벨 칸들을 전부 찾아 (라벨텍스트, 시작행, 끝행) 목록으로
+    반환함. 여러 행이 병합되어 하나의 라벨을 이루는 경우와, 병합 없이 단독으로 있는 라벨(예:
+    그 기간에 항목이 하나뿐인 경우) 둘 다 포함함."""
+    merge_end = {mc.min_row: mc.max_row for mc in ws.merged_cells.ranges if mc.min_col == 1 and mc.max_col == 1}
+    blocks = []
+    for r in range(1, ws.max_row + 1):
+        cell = ws.cell(row=r, column=1)
+        if isinstance(cell, MergedCell):
+            continue
+        v = cell.value
+        if v in (None, ""):
+            continue
+        blocks.append((str(v), r, merge_end.get(r, r)))
+    return blocks
+
+
+ROLLOVER_BUFFER_ROWS = 25
+
+
+def _rollover_period_block(ws, header_map: dict, target_row: int, period_label: str) -> int:
+    """새 항목을 target_row에 넣기 전에 호출함. 이 항목이 속한 정산기간(period_label)에 맞는
+    라벨 블록으로 target_row를 맞춰줌.
+    - 통합파일은 보통 몇 달치 정산기간 블록(라벨 + 여분 행)을 미리 만들어두는 서식이라, 새
+      기간으로 넘어갈 때 그 미리 만들어둔 블록까지 건너뛰어 들어가야 하는데, 지금까지는 항상
+      '마지막으로 채워진 행 바로 다음'에만 넣어서 새 기간 블록을 건너뛰고 예전 기간 라벨
+      아래에 잘못 들어가는 문제가 있었음.
+    - 방금 끝난 기간 블록에 남아있던 미사용 여분 행은 삭제하고, 그만큼 아래 블록들을 앞으로
+      당겨서 서식이 계속 깔끔하게 이어지도록 함.
+    - 컬럼 A에 정산기간 라벨이 아예 없는(이 서식을 안 쓰는) 시트는 손대지 않고 그대로 둠."""
+    name_idx = header_map.get("매장명")
+    if name_idx is None:
+        return target_row
+
+    blocks = _col_a_label_blocks(ws)
+    if not blocks:
+        return target_row  # 이 서식(기간 블록 미리 만들어두기)을 안 쓰는 시트는 그대로 둠
+
+    for label, start, end in blocks:
+        if start <= target_row <= end:
+            if label == period_label:
+                return target_row  # 이미 맞는 기간 블록 안에 있음
+            break  # target_row가 속한 블록이 있는데 기간이 다르면 아래에서 처리
+
+    match = next(((start, end) for label, start, end in blocks if label == period_label), None)
+
+    if match is None:
+        # 미리 만들어둔 블록이 없음(향후 기간이 다 소진됨) -> 새로 라벨 + 여분 행을 만듦
+        ws.cell(row=target_row, column=1).value = period_label
+        end_row = target_row + ROLLOVER_BUFFER_ROWS - 1
+        if end_row > target_row:
+            ws.merge_cells(f"A{target_row}:A{end_row}")
+        return target_row
+
+    block_start, _block_end = match
+    if block_start == target_row:
+        return target_row
+    if block_start < target_row:
+        return target_row  # 이상 상황(라벨 블록이 이미 지나간 위치) - 안전하게 그대로 둠
+
+    gap = block_start - target_row
+    _delete_blank_rows_and_shift(ws, target_row, gap)
+    return target_row
+
+
+def _delete_blank_rows_and_shift(ws, start_row: int, count: int) -> None:
+    """start_row부터 count개의 빈 여분 행을 지우고 그 아래 모든 행을 count칸 위로 당김.
+    수식은 Translator로 새 위치에 맞게 다시 옮기고, 컬럼 A(월별)의 정산기간 라벨 병합도
+    같이 당김. start_row~start_row+count-1 구간은 실제 데이터가 없는 빈 행이어야 안전함
+    (호출하는 쪽인 _rollover_period_block에서 이미 그렇게 보장함)."""
+    max_row = ws.max_row
+    max_col = ws.max_column
+
+    col_a_merges = [mc for mc in list(ws.merged_cells.ranges) if mc.min_col == 1 and mc.max_col == 1]
+
+    to_shift = []
+    for mc in col_a_merges:
+        if mc.min_row >= start_row:
+            to_shift.append(mc)
+        elif mc.max_row >= start_row:
+            # 방금 끝난 기간의 라벨 블록이 삭제 구간까지 넘어와 있던 경우 -> 실제 데이터가
+            # 있는 부분(삭제 구간 시작 직전)까지로 줄임(당기지는 않음)
+            ws.unmerge_cells(str(mc))
+            new_end = start_row - 1
+            if new_end > mc.min_row:
+                ws.merge_cells(f"A{mc.min_row}:A{new_end}")
+
+    for mc in to_shift:
+        ws.unmerge_cells(str(mc))
+
+    for r in range(start_row + count, max_row + 1):
+        dst_row = r - count
+        for c in range(1, max_col + 1):
+            src = ws.cell(row=r, column=c)
+            dst = ws.cell(row=dst_row, column=c)
+            if isinstance(dst, MergedCell):
+                continue
+            val = None if isinstance(src, MergedCell) else src.value
+            if isinstance(val, str) and val.startswith("="):
+                try:
+                    val = Translator(val, origin=src.coordinate).translate_formula(dst.coordinate)
+                except Exception:
+                    pass
+            dst.value = val
+            if not isinstance(src, MergedCell):
+                dst.number_format = src.number_format
+                dst.fill = copy.copy(src.fill)
+                dst.font = copy.copy(src.font)
+                dst.alignment = copy.copy(src.alignment)
+                dst.border = copy.copy(src.border)
+
+    for r in range(max(max_row - count + 1, start_row), max_row + 1):
+        for c in range(1, max_col + 1):
+            cell = ws.cell(row=r, column=c)
+            if isinstance(cell, MergedCell):
+                continue
+            cell.value = None
+
+    for mc in to_shift:
+        new_min = mc.min_row - count
+        new_max = mc.max_row - count
+        if new_max >= new_min and new_min >= 1:
+            ws.merge_cells(f"A{new_min}:A{new_max}")
+
+    if max_row - count >= start_row:
+        try:
+            ws.delete_rows(max_row - count + 1, count)
+        except Exception:
+            pass
+
+
 def _parse_date_val(date_val) -> dt.date | None:
     """접수일자 셀 값을 날짜로 변환. datetime/date 객체는 그대로, 문자열('26.07.16',
     '2026-07-16', '2026.07.16' 등)은 여러 형식을 시도해서 파싱. 담당자가 개별로 셀에
@@ -1551,8 +1696,10 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
     policy_numbers = _load_policy_numbers()
     policy_no = policy_numbers.get(brand, "")
 
-    # 오래된 접수일자인 '신규' 건을 나중에 알림으로 표시하기 위해 미리 계산해둠
-    period_start, _period_end_unused = _current_period()
+    # 오래된 접수일자인 '신규' 건을 나중에 알림으로 표시하기 위해, 그리고 정산기간 라벨
+    # 블록을 맞춰넣기 위해 미리 계산해둠
+    period_start, period_end = _current_period()
+    current_period_label = _format_period_label(period_start, period_end)
 
     new_stores = []
     closed_count = 0
@@ -1609,6 +1756,7 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
             vals["접수일자"] = dt.date.today()
 
             target_row = _find_target_row(master_ws, master_header, master_min_row)
+            target_row = _rollover_period_block(master_ws, master_header, target_row, current_period_label)
             template_row = _find_template_row(master_ws, master_header, master_min_row, target_row)
             _write_row(master_ws, master_header, target_row, vals, template_row)
 
@@ -1668,6 +1816,7 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
             vals["접수일자"] = dt.date.today()
 
             target_row = _find_target_row(master_ws, master_header, master_min_row)
+            target_row = _rollover_period_block(master_ws, master_header, target_row, current_period_label)
             template_row = _find_template_row(master_ws, master_header, master_min_row, target_row)
             _write_row(master_ws, master_header, target_row, vals, template_row)
             closed_count += 1
