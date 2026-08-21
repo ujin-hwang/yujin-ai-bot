@@ -94,7 +94,9 @@ def _find_file_ci(directory: str, filename: str) -> str | None:
     return None
 
 
-CERT_FONT_PATH = _find_asset("NotoSerifKR.ttf")
+CERT_FONT_PATH = _find_asset("batang.ttc")
+CERT_FONT_INDEX = 1  # batang.ttc 안에는 바탕/바탕체/궁서/궁서체 4종류가 들어있는데, 서식 PDF들이 실제로
+# 쓰는 폰트가 '바탕체(BatangChe)'라서(pdfplumber로 서식 글자를 직접 확인함) 그 인덱스를 지정해서 씀
 CERT_TEMPLATE_PATH = _find_asset("cert_template.pdf")  # 브랜드별 서식이 없을 때 쓰는 기본값(트레몰로 서식)
 CERT_PAGE_W, CERT_PAGE_H = 595.2, 841.92
 CERT_FONT_SCALE = 4  # 텍스트를 이미지로 그릴 때 선명하게 보이도록 확대 비율
@@ -773,7 +775,7 @@ def _sanitize_for_font(text: str) -> str:
 def _render_text_image(text: str, font_size_pt: float):
     text = _sanitize_for_font(text)
     px_size = int(font_size_pt * CERT_FONT_SCALE)
-    font = ImageFont.truetype(CERT_FONT_PATH, px_size)
+    font = ImageFont.truetype(CERT_FONT_PATH, px_size, index=CERT_FONT_INDEX)
     ascent, descent = font.getmetrics()
     bbox = font.getbbox(text)
     text_w = bbox[2] - bbox[0]
@@ -801,9 +803,13 @@ def _build_certificate_pdf(data: dict, brand: str) -> bytes:
         c.rect(x0 - 2, CERT_PAGE_H - bottom - 2, (x1 - x0) + 4, (bottom - top) + 4, fill=1, stroke=0)
 
     def draw_text(x0, bottom, s, size=12):
+        # 이미지 자체가 이미 '글꼴 상 맨 아래(descent)'까지 포함해서 그려지므로, 이미지의 맨 아래를
+        # 그 줄의 바텀 위치(baseline_y)에 바로 맞추면 됨. 예전에는 여기서 descent_pt를 한 번 더 빼서
+        # 삽입한 글자들이 서식 원문 글자보다 항상 살짝(약 2pt) 아래로 처지는 문제가 있었음(바탕체로
+        # 바꾸면서 서식과 나란히 놓고 보니 확실히 티가 남 — 사용자 확인 사례).
         img, w_pt, h_pt, descent_pt = _render_text_image(s, size)
         baseline_y = y_of(bottom)
-        c.drawImage(ImageReader(img), x0, baseline_y - descent_pt, width=w_pt, height=h_pt, mask="auto")
+        c.drawImage(ImageReader(img), x0, baseline_y, width=w_pt, height=h_pt, mask="auto")
 
     def row_bottom(top):
         return top + 12.0
