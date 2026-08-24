@@ -72,13 +72,6 @@ os.makedirs(PERSIST_DIR, exist_ok=True)
 PLACES_FILE = os.path.join(PERSIST_DIR, "places.json")
 
 
-def _find_asset(filename: str) -> str:
-    for candidate in (os.path.join(_BASE_DIR, "assets", filename), os.path.join(_BASE_DIR, filename)):
-        if os.path.exists(candidate):
-            return candidate
-    return os.path.join(_BASE_DIR, filename)
-
-
 def _find_file_ci(directory: str, filename: str) -> str | None:
     """Render 서버(Linux)는 대소문자를 구분해서, GitHub 웹에서 파일 이름을 바꿀 때
     확장자가 의도치 않게 .PDF처럼 대문자로 바뀌어 있으면 .pdf로 찾다가 못 찾는 경우가 생김.
@@ -92,6 +85,19 @@ def _find_file_ci(directory: str, filename: str) -> str | None:
         if entry.lower() == target:
             return os.path.join(directory, entry)
     return None
+
+
+def _find_asset(filename: str) -> str:
+    # GitHub 웹으로 파일을 올릴 때 이름 첫 글자가 의도치 않게 대문자로 바뀌는 경우가 있어서
+    # (예: batang.ttc -> Batang.ttc), 정확한 이름으로 못 찾으면 대소문자 구분 없이 한 번 더 찾아봄
+    for base in (os.path.join(_BASE_DIR, "assets"), _BASE_DIR):
+        candidate = os.path.join(base, filename)
+        if os.path.exists(candidate):
+            return candidate
+        ci_match = _find_file_ci(base, filename)
+        if ci_match:
+            return ci_match
+    return os.path.join(_BASE_DIR, filename)
 
 
 CERT_FONT_PATH = _find_asset("batang.ttc")
