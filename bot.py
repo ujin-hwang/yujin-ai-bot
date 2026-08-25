@@ -922,6 +922,31 @@ def _looks_like_korean_text(v) -> bool:
     return bool(_KOREAN_RE.search(str(v)))
 
 
+def _is_placeholder_code(code) -> bool:
+    """'미개설(추후전달)', '코드미개설상태'처럼 매장코드가 아직 배정되지 않아서 담당자가
+    임시로 적어넣은 안내 문구인 경우를 가려냄. 이런 값을 진짜 매장코드처럼 dedup 키에
+    그대로 쓰면, 나중에 실제 코드가 배정된 뒤 같은 매장이 다시 파일에 실려 오거나(담당자가
+    예전 이력을 안 지우고 계속 붙여보내는 경우가 있음) 문구가 미세하게 달라지면(예: '추후
+    전달' vs '추후전달') 매번 새 매장으로 잘못 인식해서 중복 등록/가입증명서 재발급으로
+    이어짐. 매장코드 칸의 각 줄이 전부 실제 코드 패턴(_STORE_CODE_RE)이어야 '진짜 코드'로
+    인정하고, 하나라도 아니면 placeholder로 봄."""
+    if not code:
+        return True
+    segments = [s.strip() for s in str(code).split("\n") if s.strip()]
+    if not segments:
+        return True
+    return not all(_looks_like_store_code(seg) for seg in segments)
+
+
+def _store_identity_key(vals: dict) -> tuple:
+    """매장코드가 없어도 같은 매장인지 알아볼 수 있도록, 매장명+사업자번호(없으면 주소)로
+    만드는 보조 식별 키. 공백/줄바꿈 차이는 무시함."""
+    name = re.sub(r"\s+", "", str(vals.get("매장명") or ""))
+    biz_no = re.sub(r"\s+", "", str(vals.get("사업자번호") or ""))
+    addr = re.sub(r"\s+", "", str(vals.get("매장주소") or ""))
+    return (name, biz_no or addr)
+
+
 def _build_header_map(ws) -> tuple[dict, int]:
     """헤더 행을 자동으로 찾아 '정규화된 헤더명 -> 0-based 컬럼 인덱스' 매핑과 데이터 시작 행을 반환.
     '매장명' 등 주요 라벨이 있는 행(main_row) 바로 아래 행에 병합된 그룹(재물부문 등)의
@@ -1735,6 +1760,7 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
     # 위해 어떤 서브타입을 처리하든 정상/상설 등 모든 서브타입에 이미 등록된 매장 전체를 합쳐서
     # 중복 여부를 확인함(실제로 새 행을 쓰는 시트는 여전히 해당 서브타입 시트 하나뿐).
     all_new_existing_keys = set()
+    all_new_existing_identities = set()
     for _st, _mws in master_new_sheets.items():
         _mws_values = master_new_sheets_values.get(_st)
         if _mws_values is None:
@@ -1742,10 +1768,11 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
         _h, _mr = _build_header_map(_mws)
         if not _h:
             continue
-        all_new_existing_keys |= {
-            _dedup_key(v)
-            for v in _extract_data_rows(_mws_values, _h, _mr, formula_ws=_mws, wb_values=master_wb_values)
-        }
+        _existing_rows = _extract_data_rows(_mws_values, _h, _mr, formula_ws=_mws, wb_values=master_wb_values)
+        all_new_existing_keys |= {_dedup_key(v) for v in _existing_rows}
+        all_new_existing_identities |= {_store_identity_key(v) for v in _existing_rows}
+
+    skipped_placeholder_stores = []
 
     for sub_type, input_ws in input_new_sheets.items():
         master_ws = master_new_sheets.get(sub_type)
@@ -1757,14 +1784,27 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
         if not input_header or not master_header:
             continue
         existing_keys = set(all_new_existing_keys)
+        existing_identities = set(all_new_existing_identities)
         rate1 = _extract_rate(master_ws, master_header, "연간재물보험료", r"\*([\d.]+)%", 0.0665, master_min_row)
         rate2 = _extract_rate(master_ws, master_header, "연간영업배상보험료", r"\*([\d.]+)", 1793, master_min_row)
 
         for vals in _extract_data_rows(input_ws, input_header, input_min_row):
+            # 매장코드가 아직 '미개설(추후전달)' 같은 임시 문구인 채로 왔는데, 매장명+사업자번호
+            # (또는 주소)가 이미 등록된 매장과 같으면 -- 실제 코드가 나중에 배정되어 등록된 뒤
+            # 담당자가 예전 임시 이력을 다시 보낸 경우일 수 있음. 이 경우 매장코드 문구 자체가
+            # 매번 미세하게 달라질 수 있어(dedup 키로는 안 걸러짐) 그대로 두면 같은 매장이 계속
+            # 중복 등록되므로, 여기서 별도로 걸러서 건너뜀(통합파일에 추가/증명서 발급 안 함)
+            if _is_placeholder_code(vals.get("매장코드")) and _store_identity_key(vals) in existing_identities:
+                skipped_placeholder_stores.append({
+                    "store_name": str(vals.get("매장명") or "").strip(),
+                })
+                continue
+
             key = _dedup_key(vals)
             if key in existing_keys:
                 continue
             existing_keys.add(key)
+            existing_identities.add(_store_identity_key(vals))
 
             # 오래된 접수일자 경고는 정산파일에 실제로 적혀 있던 원래 접수일자 기준으로
             # 판단해야 하므로, 접수일자를 오늘 날짜로 덮어쓰기 전에 미리 계산해둠
@@ -1800,7 +1840,9 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
     master_closed_sheets = _find_type_sheets(master_wb, "폐점매장")
     master_closed_sheets_values = _find_type_sheets(master_wb_values, "폐점매장")
 
-    # 신규매장과 마찬가지로, 정상/상설 등 모든 서브타입에 이미 등록된 폐점매장을 합쳐서 중복 검사함
+    # 신규매장과 마찬가지로, 정상/상설 등 모든 서브타입에 이미 등록된 폐점매장을 합쳐서 중복 검사함.
+    # (폐점매장 시트는 애초에 '매장코드' 칸이 없는 서식이라 미배정 코드 문제가 생기지 않으므로,
+    # 신규매장과 달리 여기는 원래 이름+날짜 기준 dedup만으로 충분함)
     all_closed_existing_keys = set()
     for _st, _mws in master_closed_sheets.items():
         _mws_values = master_closed_sheets_values.get(_st)
@@ -1842,7 +1884,14 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
             closed_count += 1
 
     if not new_stores and not closed_count:
-        return {"brand": brand, "cold_start": False, "new_stores": [], "closed_count": 0, "master_bytes": None}
+        return {
+            "brand": brand,
+            "cold_start": False,
+            "new_stores": [],
+            "closed_count": 0,
+            "master_bytes": None,
+            "skipped_placeholder_stores": skipped_placeholder_stores,
+        }
 
     # 이번 정산 기간(16일~다음달 15일) 기준으로 신규/폐점매장 시트 전체를 다시 칠함.
     # 새로 추가된 항목뿐 아니라, 기간이 지나 더 이상 '이번 달' 항목이 아닌 예전 노란색도
@@ -1870,6 +1919,7 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
         "master_bytes": master_bytes,
         "has_policy_no": bool(policy_no),
         "has_cert_template": _has_cert_template(brand),
+        "skipped_placeholder_stores": skipped_placeholder_stores,
     }
 
 
@@ -1898,6 +1948,17 @@ async def _sync_and_notify(bot, chat_id: int, file_bytes: bytes) -> dict | None:
             text=f"📁 '{brand}' 통합파일을 처음 등록했어요. 앞으로 이 파일을 기준으로 신규/폐점 매장을 비교할게요.",
         )
         return result
+
+    skipped_placeholder_stores = result.get("skipped_placeholder_stores") or []
+    if skipped_placeholder_stores:
+        names = ", ".join(s["store_name"] for s in skipped_placeholder_stores)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"ℹ️ {names}: 매장코드가 아직 '미개설(추후전달)' 같은 임시 문구인 채로 다시 들어왔는데, "
+                "매장명/사업자번호가 이미 등록된 매장과 같아서 중복 등록하지 않고 건너뛰었어요."
+            ),
+        )
 
     if not result["new_stores"] and not result["closed_count"]:
         await bot.send_message(chat_id=chat_id, text=f"'{brand}' 기준으로 새로운 신규/폐점 매장이 없어요.")
