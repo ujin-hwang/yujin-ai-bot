@@ -3,12 +3,14 @@ import io
 import re
 import json
 import copy
+import uuid
 import asyncio
 import datetime as dt
 import logging
 import imaplib
 import smtplib
 import email
+import email.utils
 from email.header import decode_header
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -23,11 +25,22 @@ from PIL import Image, ImageDraw, ImageFont
 from reportlab.pdfgen import canvas as pdf_canvas
 from reportlab.lib.utils import ImageReader
 from pypdf import PdfReader, PdfWriter
-from telegram import Update
+
+try:
+    # 구글 드라이브 자동 업로드용(설정 안 해두면 그냥 이 기능만 꺼짐)
+    from google.oauth2 import service_account as _gdrive_service_account
+    from googleapiclient.discovery import build as _gdrive_build
+    from googleapiclient.http import MediaInMemoryUpload as _gdrive_media
+except ImportError:
+    _gdrive_service_account = None
+    _gdrive_build = None
+    _gdrive_media = None
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     ContextTypes,
     filters,
 )
@@ -51,7 +64,17 @@ MAIL_CHECK_INTERVAL = int(os.environ.get("MAIL_CHECK_INTERVAL", "120"))
 # (구글 계정에 "다른 이메일 주소로 보내기" 별칭으로 인증된 주소여야 정상 발송돼요)
 MAIL_FROM_ADDRESS = os.environ.get("MAIL_FROM_ADDRESS", GMAIL_ADDRESS)
 
+# 보낸사람은 그대로 GMAIL_ADDRESS로 두되(별도 별칭 인증 없이 바로 되는 방식), 담당자가
+# "답장"을 누르면 유진님의 실제 업무 메일(네이버, 구글로 자동전달 중)로 가도록 지정하는 주소
+MAIL_REPLY_TO = os.environ.get("MAIL_REPLY_TO", MAIL_FROM_ADDRESS)
+
 MODEL_NAME = os.environ.get("MODEL_NAME", "claude-haiku-4-5-20251001")
+
+# 가입증명서를 구글 드라이브(유진님 PC에 동기화된 폴더)에도 자동으로 올려주는 기능용 설정.
+# 서비스 계정 방식이라 유진님이 매번 로그인/인증할 필요 없이, 처음에 딱 한 번 그 서비스
+# 계정한테 드라이브 폴더 하나를 "공유"만 해두면 계속 자동으로 파일을 넣어줌.
+GDRIVE_SERVICE_ACCOUNT_JSON = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON")
+GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID")
 
 # 카카오 REST API 키 (카카오맵 대중교통/도보/자전거 길찾기 + 카카오모빌리티 자동차 길찾기 공용)
 KAKAO_REST_API_KEY = os.environ.get("KAKAO_REST_API_KEY")
@@ -104,6 +127,26 @@ CERT_FONT_PATH = _find_asset("batang.ttc")
 CERT_FONT_INDEX = 1  # batang.ttc 안에는 바탕/바탕체/궁서/궁서체 4종류가 들어있는데, 서식 PDF들이 실제로
 # 쓰는 폰트가 '바탕체(BatangChe)'라서(pdfplumber로 서식 글자를 직접 확인함) 그 인덱스를 지정해서 씀
 CERT_TEMPLATE_PATH = _find_asset("cert_template.pdf")  # 브랜드별 서식이 없을 때 쓰는 기본값(트레몰로 서식)
+
+# 담당자에게 보내는 이메일 맨 아래에 붙는 명함/서명. 바뀌면 여기만 수정하면 됨.
+_CERT_EMAIL_SIGNATURE = (
+    "황유진 대표\n"
+    "다온인슈 기업보험 전문컨설팅 / 대표이사\n\n"
+    "우)06620 서울특별시 서초구 강남대로 375 서초현대타워 10층\n"
+    "Tel 02-6953-8129 Mobile 010-9810-5503\n"
+    "Fax 0303-0950-5503\n"
+    "Email yujin.hwang@daonins.co.kr"
+)
+
+# 담당자에게 가입증명서를 이메일로 보낼 때 본문 문구. {store_name} 자리에 매장명이 자동으로 들어감.
+# 문구를 바꾸고 싶으면 여기만 수정하면 됨.
+_CERT_EMAIL_BODY_TEMPLATE = (
+    "안녕하십니까.\n\n"
+    "요청해주신 '{store_name}' 신규 매장 가입증명서를 첨부와 같이 보내드립니다.\n\n"
+    "확인 부탁드리며, 문의사항 있으시면 언제든 연락 주시기 바랍니다.\n\n"
+    "감사합니다.\n\n"
+    "--\n" + _CERT_EMAIL_SIGNATURE
+)
 CERT_PAGE_W, CERT_PAGE_H = 595.2, 841.92
 CERT_FONT_SCALE = 4  # 텍스트를 이미지로 그릴 때 선명하게 보이도록 확대 비율
 
@@ -124,6 +167,14 @@ CERT_ROWS_BY_BRAND = {
 MASTERS_DIR = os.path.join(PERSIST_DIR, "masters")
 # 브랜드별 증권번호를 저장해두는 파일 (파일명에서 못 찾을 때 사용)
 POLICY_NUMBERS_FILE = os.path.join(PERSIST_DIR, "policy_numbers.json")
+# 정산양식을 보내는 담당자 이름 -> 이메일 주소. 신규매장 가입증명서를 그 담당자에게
+# 자동으로 이메일로 보내줄 때 씀(엑셀 '접수자' 칸의 이름으로 찾음)
+CONTACTS_FILE = os.path.join(PERSIST_DIR, "contacts.json")
+# 담당자에게 이메일로 보내기 전에 유진님 확인을 거치는 가입증명서들을 보관하는 곳.
+# "보내기"를 누르기 전까지는 실제로 발송되지 않고 여기에 대기함(재배포/재시작해도
+# 안 없어지도록 디스크에 저장).
+PENDING_CERTS_DIR = os.path.join(PERSIST_DIR, "pending_certs")
+PENDING_CERTS_INDEX_FILE = os.path.join(PERSIST_DIR, "pending_certs.json")
 # 브랜드별로 파일을 보내드릴 때 쓸 표시용 파일명(엑셀 A1 셀 이름과 다르게 쓰고 싶을 때)
 BRAND_NAMES_FILE = os.path.join(PERSIST_DIR, "brand_names.json")
 # 담당자마다 A1 셀에 브랜드명을 다르게 적어 보내는 경우, 같은 브랜드로 취급하도록 이름을 통일시켜주는 매핑
@@ -182,8 +233,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/setbrandname <브랜드명> <표시할 이름> - 통합파일을 보내드릴 때 쓸 파일명 변경\n"
         "/sendmaster <브랜드명> - 지금 저장된 통합파일을 새로 올리지 않고 다시 받아보기\n"
         "/setbrandalias <다르게 인식된 이름> <진짜 브랜드명> - 담당자마다 다르게 적는 브랜드명을 하나로 통일\n"
-        "/setcerttemplate <브랜드명> - (예시 PDF에 답장하며 사용) 그 브랜드 전용 가입증명서 서식으로 등록\n\n"
-        "길찾기는 명령어 없이 그냥 '강남역까지 얼마나 걸려?', '홍대에서 여의도까지 어떻게 가?'처럼 물어보셔도 알아들어요.\n\n"
+        "/setcerttemplate <브랜드명> - (예시 PDF에 답장하며 사용) 그 브랜드 전용 가입증명서 서식으로 등록\n"
+        "/setcontact <담당자 이름> <이메일> - 담당자 이메일 등록 (신규매장 가입증명서 발송용)\n"
+        "/contacts - 등록된 담당자 연락처 목록 보기\n"
+        "/pending - 대기 중인(아직 안 보낸) 가입증명서 목록 보기\n"
+        "/testmail <받는이메일> - 샘플 가입증명서로 메일 발송 테스트 (받는이메일 생략하면 내 메일로)\n\n"
+        "길찾기는 명령어 없이 그냥 '강남역까지 얼마나 걸려?', '홍대에서 여의도까지 어떻게 가?'처럼 물어보셔도 알아들어요.\n"
+        "가입증명서도 'OO점 가입증명서 찾아줘'처럼 편하게 말하면 등록된 매장 중에서 찾아서 다시 보내드려요.\n\n"
         "새 이메일이 오면 자동으로 요약해서 알려드려요. 📬\n"
         "메일에 정산양식 엑셀이 첨부되어 있으면, 다운로드 안 하셔도 자동으로 확인해서 신규/폐점 매장을 반영하고 가입증명서와 갱신된 통합파일을 보내드려요.\n"
         "날씨, 최신 뉴스, 맛집 등도 그냥 물어보시면 웹 검색해서 답해드려요.\n"
@@ -1519,6 +1575,167 @@ async def set_policy_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text(f"✅ '{brand}' 브랜드의 증권번호를 등록했어요: {policy_no}")
 
 
+def _load_contacts() -> dict:
+    try:
+        with open(CONTACTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_contacts(contacts: dict) -> None:
+    os.makedirs(os.path.dirname(CONTACTS_FILE), exist_ok=True)
+    with open(CONTACTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(contacts, f, ensure_ascii=False, indent=2)
+
+
+def _norm_contact_name(name: str) -> str:
+    return re.sub(r"\s+", "", str(name or "")).strip()
+
+
+async def set_contact_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "사용법: /setcontact <담당자 이름> <이메일>\n"
+            "예: /setcontact 안해인 hian01@sejung.co.kr\n\n"
+            "이름은 정산양식 엑셀의 '접수자' 칸에 적힌 이름과 정확히 같아야 해요. "
+            "등록해두면, 그 담당자가 텔레그램으로 직접 올린 정산양식에서도 신규매장 "
+            "가입증명서를 자동으로 그 담당자 이메일로 보내드려요."
+        )
+        return
+    name = context.args[0]
+    email_addr = context.args[1]
+    contacts = _load_contacts()
+    contacts[_norm_contact_name(name)] = email_addr
+    _save_contacts(contacts)
+    await update.message.reply_text(f"✅ '{name}' 담당자의 이메일을 등록했어요: {email_addr}")
+
+
+async def list_contacts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    contacts = _load_contacts()
+    if not contacts:
+        await update.message.reply_text("등록된 담당자 연락처가 없어요. /setcontact로 등록해주세요.")
+        return
+    lines = "\n".join(f"- {name}: {addr}" for name, addr in contacts.items())
+    await update.message.reply_text(f"등록된 담당자 연락처:\n{lines}")
+
+
+def _load_pending_certs() -> dict:
+    try:
+        with open(PENDING_CERTS_INDEX_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_pending_certs(pending: dict) -> None:
+    os.makedirs(os.path.dirname(PENDING_CERTS_INDEX_FILE), exist_ok=True)
+    with open(PENDING_CERTS_INDEX_FILE, "w", encoding="utf-8") as f:
+        json.dump(pending, f, ensure_ascii=False, indent=2)
+
+
+def _queue_pending_cert(store_name: str, target_email: str, subject: str, body: str, out_name: str, pdf_bytes: bytes) -> str:
+    """가입증명서를 바로 보내지 않고 대기시켜둠. 유진님이 '보내기'를 누르면 그때 실제 발송함."""
+    os.makedirs(PENDING_CERTS_DIR, exist_ok=True)
+    cert_id = uuid.uuid4().hex[:10]
+    pdf_path = os.path.join(PENDING_CERTS_DIR, f"{cert_id}.pdf")
+    with open(pdf_path, "wb") as f:
+        f.write(pdf_bytes)
+    pending = _load_pending_certs()
+    pending[cert_id] = {
+        "store_name": store_name,
+        "target_email": target_email,
+        "subject": subject,
+        "body": body,
+        "out_name": out_name,
+        "pdf_path": pdf_path,
+    }
+    _save_pending_certs(pending)
+    return cert_id
+
+
+def _remove_pending_cert(cert_id: str) -> dict | None:
+    pending = _load_pending_certs()
+    entry = pending.pop(cert_id, None)
+    if entry is None:
+        return None
+    _save_pending_certs(pending)
+    try:
+        os.remove(entry["pdf_path"])
+    except OSError:
+        pass
+    return entry
+
+
+async def handle_cert_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if query is None:
+        return
+    if query.from_user is None or query.from_user.id != ALLOWED_USER_ID:
+        await query.answer()
+        return
+
+    data = query.data or ""
+    if ":" not in data:
+        await query.answer()
+        return
+    action, cert_id = data.split(":", 1)
+
+    pending = _load_pending_certs()
+    entry = pending.get(cert_id)
+    if entry is None:
+        await query.answer()
+        await query.edit_message_text("이미 처리됐거나 없는 요청이에요.")
+        return
+
+    if action == "sendcert":
+        await query.answer()
+        try:
+            with open(entry["pdf_path"], "rb") as f:
+                pdf_bytes = f.read()
+            _send_email(
+                entry["target_email"],
+                subject=entry["subject"],
+                body=entry["body"],
+                attachments=[(entry["out_name"], pdf_bytes)],
+            )
+            _remove_pending_cert(cert_id)
+            await query.edit_message_text(f"✅ '{entry['store_name']}' 가입증명서를 {entry['target_email']}로 보냈어요.")
+        except Exception:
+            logger.exception("대기 중이던 가입증명서 발송 중 오류")
+            await query.edit_message_text(f"⚠️ '{entry['store_name']}' 가입증명서 발송에 실패했어요. 이 메시지에서 다시 눌러 시도해주세요.")
+    elif action == "holdcert":
+        # 메시지와 버튼을 그대로 남겨둠 -> 명령어 없이도, 나중에 이 메시지를 찾아 스크롤해서
+        # 그냥 다시 '보내기'를 누르기만 하면 됨. 살짝 알려주는 팝업만 띄우고 메시지는 안 건드림.
+        await query.answer("⏸ 대기 상태예요. 나중에 이 메시지에서 다시 눌러 보내시면 돼요.", show_alert=True)
+    elif action == "cancelcert":
+        await query.answer()
+        _remove_pending_cert(cert_id)
+        await query.edit_message_text(f"🗑 '{entry['store_name']}' 가입증명서 발송을 취소했어요.")
+
+
+async def list_pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_allowed(update):
+        return
+    pending = _load_pending_certs()
+    if not pending:
+        await update.message.reply_text("대기 중인 가입증명서가 없어요.")
+        return
+    for cert_id, entry in pending.items():
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ 보내기", callback_data=f"sendcert:{cert_id}"),
+            InlineKeyboardButton("🗑 취소", callback_data=f"cancelcert:{cert_id}"),
+        ]])
+        await update.message.reply_text(
+            f"'{entry['store_name']}' → {entry['target_email']}",
+            reply_markup=keyboard,
+        )
+
+
 def _load_brand_names() -> dict:
     try:
         with open(BRAND_NAMES_FILE, "r", encoding="utf-8") as f:
@@ -1832,6 +2049,7 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
                 "store_code": str(vals.get("매장코드") or "").strip(),
                 "store_name": str(vals.get("매장명") or "").strip(),
                 "address": address,
+                "received_by": str(vals.get("접수자") or "").strip(),
                 "stale_recv_date": stale_recv_date,
                 **cert_vals,
             })
@@ -1923,13 +2141,18 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
     }
 
 
-async def _sync_and_notify(bot, chat_id: int, file_bytes: bytes) -> dict | None:
+async def _sync_and_notify(
+    bot, chat_id: int, file_bytes: bytes, requester_email: str | None = None
+) -> dict | None:
     """정산양식 엑셀을 브랜드 통합파일과 동기화하고, 결과(가입증명서/갱신된 통합파일/요약)를
     텔레그램으로 보냄. 텔레그램에 직접 파일을 올린 경우와, 메일에 첨부된 파일을 자동으로
     감지한 경우 양쪽에서 공용으로 사용함.
     브랜드를 인식하지 못하면(정산양식 형식이 아니면) 아무것도 보내지 않고 None을 반환하며,
     이 경우 어떻게 안내할지는 호출한 쪽에서 정함(메일 첨부는 정산양식이 아닐 수도 있으니
-    조용히 넘어가고, 텔레그램 직접 업로드는 사용자에게 안내함)."""
+    조용히 넘어가고, 텔레그램 직접 업로드는 사용자에게 안내함).
+    requester_email: 메일에 첨부되어 들어온 경우, 그 메일을 보낸 사람 주소. 신규매장
+    가입증명서를 만들면 이 주소로도 자동 발송함(텔레그램으로 직접 올린 경우엔 None이라
+    대신 담당자 연락처 등록부(contacts.json)에서 '접수자' 이름으로 찾음)."""
     try:
         result = _sync_brand_excel(file_bytes)
     except Exception:
@@ -1975,6 +2198,10 @@ async def _sync_and_notify(bot, chat_id: int, file_bytes: bytes) -> dict | None:
         )
 
     ended_stores = []
+    no_contact_stores = []
+    queued_stores = []
+    drive_saved = 0
+    contacts = _load_contacts()
     for store in result["new_stores"]:
         # 보험종기일이 이미 지난 건은 통합파일엔 기록해두되, 가입증명서는 만들지 않음(사용자 요청)
         if store.get("period_ended"):
@@ -1995,6 +2222,50 @@ async def _sync_and_notify(bot, chat_id: int, file_bytes: bytes) -> dict | None:
             caption=f"📄 {store['store_name']} 가입증명서",
         )
 
+        # 담당자에게 이메일로 보낼지: 메일로 들어온 건이면 그 발신 주소로, 텔레그램으로
+        # 직접 올린 건이면 엑셀 '접수자' 이름으로 등록된 연락처를 찾음. 바로 보내지 않고
+        # 유진님이 버튼으로 확인한 뒤에 실제 발송함(원치 않으면 '대기' 선택 가능)
+        target_email = requester_email
+        received_by = store.get("received_by") or ""
+        if not target_email and received_by:
+            target_email = contacts.get(_norm_contact_name(received_by))
+        if target_email and GMAIL_ADDRESS and GMAIL_APP_PASSWORD:
+            # 메일로 들어와서 처음 알게 된 담당자면, 다음부터 텔레그램으로 직접 올려도
+            # 이메일을 찾을 수 있도록 연락처에 미리 저장해둠(발송 여부와 무관하게 저장)
+            if requester_email and received_by:
+                key = _norm_contact_name(received_by)
+                if contacts.get(key) != requester_email:
+                    contacts[key] = requester_email
+                    _save_contacts(contacts)
+            cert_id = _queue_pending_cert(
+                store_name=store["store_name"],
+                target_email=target_email,
+                subject=f"[{brand}] {store['store_name']} 가입증명서",
+                body=_CERT_EMAIL_BODY_TEMPLATE.format(store_name=store["store_name"]),
+                out_name=out_name,
+                pdf_bytes=pdf_bytes,
+            )
+            queued_stores.append((store["store_name"], target_email))
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ 보내기", callback_data=f"sendcert:{cert_id}"),
+                InlineKeyboardButton("⏸ 대기", callback_data=f"holdcert:{cert_id}"),
+                InlineKeyboardButton("🗑 취소", callback_data=f"cancelcert:{cert_id}"),
+            ]])
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"담당자 {received_by or target_email}님에게 '{store['store_name']}' 가입증명서를 보낼까요?\n"
+                    "(대기를 누르면 이 메시지는 그대로 남아있으니, 나중에 다시 여기서 보내기를 누르시면 돼요)"
+                ),
+                reply_markup=keyboard,
+            )
+        elif received_by:
+            no_contact_stores.append(received_by)
+
+        # 구글 드라이브(설정해뒀으면 유진님 PC에 자동 동기화)에도 저장
+        if _upload_to_drive(out_name, pdf_bytes):
+            drive_saved += 1
+
     if ended_stores:
         lines = "\n".join(f"- {s['store_name']}({s['store_code']}) 종기일 {s['end_date']}" for s in ended_stores)
         await bot.send_message(
@@ -2008,7 +2279,22 @@ async def _sync_and_notify(bot, chat_id: int, file_bytes: bytes) -> dict | None:
     summary = f"✅ '{brand}' 통합파일을 갱신했어요.\n신규 매장 {len(result['new_stores'])}곳"
     if result["closed_count"]:
         summary += f", 폐점 매장 {result['closed_count']}곳"
+    if queued_stores:
+        queued_lines = "\n".join(f"  - {name} → {addr}" for name, addr in queued_stores)
+        summary += f"\n📧 담당자 발송 확인 대기 중(위 버튼 눌러주세요):\n{queued_lines}"
+    if drive_saved:
+        summary += f"\n💾 구글 드라이브에도 {drive_saved}건 저장했어요."
     await bot.send_message(chat_id=chat_id, text=summary)
+
+    if no_contact_stores:
+        names = ", ".join(sorted(set(no_contact_stores)))
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"ℹ️ {names} 담당자 이메일이 등록되어 있지 않아 자동 발송을 못 했어요.\n"
+                "/setcontact <담당자 이름> <이메일> 로 등록해주시면 다음부터 자동으로 보내드려요."
+            ),
+        )
 
     # 담당자가 보낸 파일에 전체 이력이 섞여 있어서, 접수일자가 아주 오래된(지난 정산기간보다도
     # 이전) 매장이 '신규'로 잡힌 경우 - 이미 예전에 다른 방식으로 처리된 건일 수 있으니 등록/증명서
@@ -2137,12 +2423,111 @@ def _send_email(to_addr: str, subject: str, body: str, attachments: list | None 
     msg["Subject"] = subject
     msg["From"] = MAIL_FROM_ADDRESS
     msg["To"] = to_addr
+    if MAIL_REPLY_TO:
+        # 보낸사람 계정은 그대로 두고, 상대방이 "답장"을 누르면 유진님 실제 업무 메일로
+        # 가도록 함(구글 별칭 인증 없이도 바로 적용됨)
+        msg["Reply-To"] = MAIL_REPLY_TO
 
     # 로그인은 항상 GMAIL_ADDRESS 계정으로 하고, 보낸사람 표시만 MAIL_FROM_ADDRESS로 바뀜
     # (구글의 "다른 이메일 주소로 보내기" 별칭 인증이 되어 있어야 함)
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
         server.sendmail(GMAIL_ADDRESS, [to_addr], msg.as_string())
+
+
+_gdrive_service = None  # 매번 새로 로그인하지 않도록 한 번 만든 클라이언트를 재사용
+
+
+def _get_gdrive_service():
+    """구글 드라이브 서비스 계정 클라이언트를 만들어서 반환함(설정 안 돼있으면 None).
+    유진님이 미리 이 서비스 계정한테 특정 드라이브 폴더를 '공유'해둬야, 그 폴더 안에
+    파일을 넣을 수 있음(유진님 로그인/인증 절차 없이 서버에서 바로 동작)."""
+    global _gdrive_service
+    if _gdrive_service is not None:
+        return _gdrive_service
+    if not (GDRIVE_SERVICE_ACCOUNT_JSON and GDRIVE_FOLDER_ID and _gdrive_build):
+        return None
+    try:
+        info = json.loads(GDRIVE_SERVICE_ACCOUNT_JSON)
+        creds = _gdrive_service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        _gdrive_service = _gdrive_build("drive", "v3", credentials=creds)
+        return _gdrive_service
+    except Exception:
+        logger.exception("구글 드라이브 연결 중 오류")
+        return None
+
+
+def _upload_to_drive(filename: str, file_bytes: bytes) -> bool:
+    """가입증명서를 유진님이 지정해둔 구글 드라이브 폴더에 올림. 그 폴더가 유진님 PC의
+    구글 드라이브 동기화 폴더 안에 있으면, PC에도 자동으로 똑같이 저장됨. 설정이 안 돼
+    있거나 실패하면 조용히 False만 반환(가입증명서 발급 자체는 그대로 진행돼야 하므로)."""
+    service = _get_gdrive_service()
+    if service is None:
+        return False
+    try:
+        media = _gdrive_media(file_bytes, mimetype="application/pdf")
+        service.files().create(
+            body={"name": filename, "parents": [GDRIVE_FOLDER_ID]},
+            media_body=media,
+            fields="id",
+        ).execute()
+        return True
+    except Exception:
+        logger.exception("구글 드라이브 업로드 중 오류")
+        return False
+
+
+async def test_mail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """실제 매장 데이터 없이, 가짜 샘플 매장으로 가입증명서 이메일 발송을 미리 테스트해봄
+    (문구/서명/첨부가 실제로 어떻게 보이는지 확인용). 사용법: /testmail <받는이메일>
+    (안 적으면 유진님 실제 메일(MAIL_REPLY_TO)로 감)"""
+    if not is_allowed(update):
+        return
+    if not GMAIL_ADDRESS or not GMAIL_APP_PASSWORD:
+        await update.message.reply_text("메일 발송 기능이 설정되어 있지 않아요.")
+        return
+    to_addr = context.args[0] if context.args else MAIL_REPLY_TO
+    if not to_addr:
+        await update.message.reply_text("사용법: /testmail <받는이메일>\n예: /testmail yujin.hwang@daonins.co.kr")
+        return
+
+    sample = {
+        "policy_no": DEFAULT_POLICY_NO,
+        "store_code": "TEST0000",
+        "store_name": "테스트매장",
+        "address": "서울특별시 서초구 강남대로 375 서초현대타워 (테스트용 샘플 주소)",
+        "stock_amt": 100000000,
+        "facility_amt": 10000000,
+        "building_amt": 0,
+        "premium": 12345,
+        "start_date": "2026.01.01",
+        "end_date": "2026.12.31",
+        "start_date_yymmdd": "260101",
+        "has_property": True,
+        "has_liability": True,
+    }
+    try:
+        pdf_bytes = _build_certificate_pdf(sample, "트레몰로")
+    except Exception:
+        logger.exception("테스트 가입증명서 생성 중 오류")
+        await update.message.reply_text("⚠️ 테스트 가입증명서 생성에 실패했어요.")
+        return
+
+    out_name = "TEST0000_테스트매장_260101.pdf"
+    body = _CERT_EMAIL_BODY_TEMPLATE.format(store_name=sample["store_name"])
+    try:
+        _send_email(
+            to_addr,
+            subject="[테스트] 테스트매장 가입증명서",
+            body=body,
+            attachments=[(out_name, pdf_bytes)],
+        )
+        await update.message.reply_text(f"✅ 테스트 이메일을 {to_addr}로 보냈어요. 메일함에서 확인해보세요.")
+    except Exception:
+        logger.exception("테스트 이메일 발송 중 오류")
+        await update.message.reply_text("⚠️ 테스트 이메일 발송에 실패했어요.")
 
 
 async def mail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2164,6 +2549,114 @@ async def mail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         f"보낸사람: {MAIL_FROM_ADDRESS}\n받는사람: {to_addr}\n메일 제목을 입력해주세요."
     )
+
+
+def _all_registered_store_rows() -> dict:
+    """등록된 모든 브랜드의 '신규매장' 시트를 다 뒤져서, 매장명 -> 그 매장이 있던 행(들) 정보를
+    모아둠. '가입증명서를 다시 만들어줘' 같은 요청이 오면 여기서 검색해서 다시 만듦."""
+    result: dict[str, list[dict]] = {}
+    if not os.path.isdir(MASTERS_DIR):
+        return result
+    for fname in os.listdir(MASTERS_DIR):
+        if not fname.lower().endswith(".xlsx"):
+            continue
+        brand = fname[:-5]
+        path = os.path.join(MASTERS_DIR, fname)
+        try:
+            wb = openpyxl.load_workbook(path, data_only=False)
+            wb_values = openpyxl.load_workbook(path, data_only=True)
+        except Exception:
+            continue
+        new_sheets = _find_type_sheets(wb, "신규매장")
+        new_sheets_values = _find_type_sheets(wb_values, "신규매장")
+        for sub_type, ws in new_sheets.items():
+            ws_values = new_sheets_values.get(sub_type)
+            if ws_values is None:
+                continue
+            header, min_row = _build_header_map(ws)
+            if not header:
+                continue
+            rate1 = _extract_rate(ws, header, "연간재물보험료", r"\*([\d.]+)%", 0.0665, min_row)
+            rate2 = _extract_rate(ws, header, "연간영업배상보험료", r"\*([\d.]+)", 1793, min_row)
+            for vals in _extract_data_rows(ws_values, header, min_row, formula_ws=ws, wb_values=wb_values):
+                name_raw = str(vals.get("매장명") or "")
+                for seg in re.split(r"\n+", name_raw):
+                    seg = seg.strip()
+                    if not seg:
+                        continue
+                    result.setdefault(seg, []).append({
+                        "brand": brand,
+                        "sub_type": sub_type,
+                        "vals": vals,
+                        "rate1": rate1,
+                        "rate2": rate2,
+                    })
+    return result
+
+
+_CERT_LOOKUP_RE = re.compile(r"가입\s*증명서")
+_CERT_LOOKUP_VERBS = ("찾아", "다시", "재발급", "재전송", "보내줘", "보내주세요", "올려줘", "올려주세요", "보여줘")
+
+
+async def _handle_cert_lookup_request(update: Update, context: ContextTypes.DEFAULT_TYPE, user_text: str) -> bool:
+    """'계산점 가입증명서 찾아줘'처럼, 이미 등록된 매장의 가입증명서를 다시 보내달라는
+    자연스러운 문장을 감지해서 처리함. 새 명령어를 안 외우고 그냥 말로 요청할 수 있게 함.
+    True를 반환하면 이미 답장까지 다 처리한 것이므로 일반 대화(Claude)로 안 넘어감."""
+    if not _CERT_LOOKUP_RE.search(user_text):
+        return False
+    if not any(v in user_text for v in _CERT_LOOKUP_VERBS):
+        return False
+
+    chat_id = update.effective_chat.id
+    store_index = _all_registered_store_rows()
+    if not store_index:
+        return False
+
+    # 문장 안에 등록된 매장명이 포함돼 있는지 확인. 여러 매장명이 겹쳐 걸리면(예: '점'으로
+    # 끝나는 짧은 이름이 긴 이름의 일부인 경우) 가장 긴 이름을 우선함
+    matches = [name for name in store_index if name and name in user_text]
+    if not matches:
+        return False
+    matches.sort(key=len, reverse=True)
+    store_name = matches[0]
+    entries = store_index[store_name]
+
+    # 같은 이름으로 여러 건이 있으면(갱신/재등록 등) 접수일자가 가장 최근인 걸 보내줌
+    def _recv_key(entry):
+        return _parse_date_val(entry["vals"].get("접수일자")) or dt.date.min
+
+    entries.sort(key=_recv_key, reverse=True)
+    chosen = entries[0]
+
+    try:
+        vals = chosen["vals"]
+        cert_vals = _compute_new_store_cert_values(vals, chosen["rate1"], chosen["rate2"])
+        address = str(vals.get("매장주소") or "").strip()
+        address = re.sub(r"\s*\n\s*", " ", address)
+        address = re.sub(r"(?<=\S)\(", " (", address)
+        policy_numbers = _load_policy_numbers()
+        store = {
+            "policy_no": policy_numbers.get(chosen["brand"]) or DEFAULT_POLICY_NO,
+            "store_code": str(vals.get("매장코드") or "").strip(),
+            "store_name": str(vals.get("매장명") or "").strip(),
+            "address": address,
+            **cert_vals,
+        }
+        pdf_bytes = _build_certificate_pdf(store, chosen["brand"])
+    except Exception:
+        logger.exception("가입증명서 재검색/재생성 중 오류")
+        await update.message.reply_text(f"⚠️ '{store_name}' 가입증명서를 다시 만드는 중 오류가 발생했어요.")
+        return True
+
+    out_name = f"{store['store_code']}_{store['store_name']}_{store['start_date_yymmdd']}.pdf"
+    extra = f" (같은 이름으로 {len(entries)}건 등록되어 있어서 가장 최근 걸로 보내드려요)" if len(entries) > 1 else ""
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=io.BytesIO(pdf_bytes),
+        filename=out_name,
+        caption=f"📄 {store['store_name']} 가입증명서{extra}",
+    )
+    return True
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2261,6 +2754,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             else:
                 await update.message.reply_text("메일 발송을 취소했어요.")
             return
+
+    # '계산점 가입증명서 찾아줘'처럼 자연스러운 문장으로 재발급을 요청한 경우 감지해서 처리
+    if await _handle_cert_lookup_request(update, context, user_text):
+        return
 
     # 자연스러운 문장으로 길찾기를 요청한 경우 감지해서 처리
     if await _handle_natural_route_request(update, context, user_text):
@@ -2414,10 +2911,14 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
             text = f"📬 새 메일 도착\n\n보낸사람: {sender}\n제목: {subject}\n\n요약:\n{summary}"
             await context.bot.send_message(chat_id=ALLOWED_USER_ID, text=text)
 
-            # 정산양식 엑셀 첨부파일이 있으면 자동으로 브랜드 통합파일과 동기화
+            # 정산양식 엑셀 첨부파일이 있으면 자동으로 브랜드 통합파일과 동기화하고,
+            # 새로 만들어진 가입증명서는 이 메일을 보낸 사람에게도 자동으로 보내줌
+            sender_email = email.utils.parseaddr(sender)[1] or None
             for att_filename, att_bytes in _extract_xlsx_attachments(msg):
                 try:
-                    result = await _sync_and_notify(context.bot, ALLOWED_USER_ID, att_bytes)
+                    result = await _sync_and_notify(
+                        context.bot, ALLOWED_USER_ID, att_bytes, requester_email=sender_email
+                    )
                 except Exception:
                     logger.exception("메일 첨부 엑셀 처리 중 오류")
                     continue
@@ -2438,6 +2939,7 @@ def main() -> None:
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("remind", remind))
     app.add_handler(CommandHandler("mail", mail_command))
+    app.add_handler(CommandHandler("testmail", test_mail_command))
     app.add_handler(CommandHandler("route", route_start))
     app.add_handler(CommandHandler("sethome", set_home))
     app.add_handler(CommandHandler("setwork", set_work))
@@ -2450,6 +2952,10 @@ def main() -> None:
     app.add_handler(CommandHandler("sendmaster", send_master_command))
     app.add_handler(CommandHandler("setbrandalias", set_brand_alias_command))
     app.add_handler(CommandHandler("setcerttemplate", set_cert_template_command))
+    app.add_handler(CommandHandler("setcontact", set_contact_command))
+    app.add_handler(CommandHandler("contacts", list_contacts_command))
+    app.add_handler(CommandHandler("pending", list_pending_command))
+    app.add_handler(CallbackQueryHandler(handle_cert_confirmation))
     app.add_handler(MessageHandler(filters.LOCATION, handle_location))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
