@@ -2273,7 +2273,7 @@ async def _sync_and_notify(
             no_contact_stores.append(received_by)
 
         # 구글 드라이브(설정해뒀으면 유진님 PC에 자동 동기화)에도 저장
-        if _upload_to_drive(out_name, pdf_bytes):
+        if _upload_to_drive(out_name, pdf_bytes, brand=brand):
             drive_saved += 1
 
     for target_email, group in cert_groups.items():
@@ -2499,17 +2499,75 @@ def _get_gdrive_service():
         return None
 
 
-def _upload_to_drive(filename: str, file_bytes: bytes) -> bool:
-    """가입증명서를 유진님이 지정해둔 구글 드라이브 폴더에 올림. 그 폴더가 유진님 PC의
-    구글 드라이브 동기화 폴더 안에 있으면, PC에도 자동으로 똑같이 저장됨. 설정이 안 돼
-    있거나 실패하면 조용히 False만 반환(가입증명서 발급 자체는 그대로 진행돼야 하므로)."""
+def _gdrive_find_child_folder(service, parent_id: str, predicate) -> str | None:
+    """parent_id 밑에 있는 폴더들 중 predicate(name)이 True인 첫 폴더의 id를 찾아 반환.
+    없으면 None."""
+    query = (
+        f"'{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' "
+        "and trashed=false"
+    )
+    resp = service.files().list(q=query, fields="files(id,name)", pageSize=200).execute()
+    for f in resp.get("files", []):
+        if predicate(f["name"]):
+            return f["id"]
+    return None
+
+
+def _gdrive_create_folder(service, parent_id: str, name: str) -> str:
+    meta = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
+    }
+    folder = service.files().create(body=meta, fields="id").execute()
+    return folder["id"]
+
+
+def _gdrive_period_prefix(period_start: dt.date, period_end: dt.date) -> str:
+    """유진님이 실제로 쓰시는 정산기간 폴더 이름 규칙: 'MM15_MM15' (예: 8/16~9/15 기간은
+    '0815_0915'). 시작월의 15일 + 종료월의 15일을 이어붙인 형태(시작일 16일 자체가 아님)."""
+    return f"{period_start.month:02d}15_{period_end.month:02d}15"
+
+
+def _resolve_drive_target_folder(service, brand: str) -> str | None:
+    """GDRIVE_FOLDER_ID(예: '가입증명서및정산' 폴더) 밑에서 이번 정산기간 폴더를 찾고(없으면
+    '유진님 최근 사용 방식'대로 새로 만듦), 그 안에서 브랜드 폴더를 찾아(없으면 새로 만들어서)
+    최종적으로 파일을 올릴 폴더의 id를 반환함."""
+    period_start, period_end = _current_period()
+    prefix = _gdrive_period_prefix(period_start, period_end)
+    period_folder_id = _gdrive_find_child_folder(
+        service, GDRIVE_FOLDER_ID, lambda name: name.startswith(prefix)
+    )
+    if period_folder_id is None:
+        period_folder_id = _gdrive_create_folder(
+            service, GDRIVE_FOLDER_ID, f"{prefix}가입증명서및변경신청서"
+        )
+    brand_folder_id = _gdrive_find_child_folder(
+        service, period_folder_id, lambda name: name == brand or name in brand or brand in name
+    )
+    if brand_folder_id is None:
+        brand_folder_id = _gdrive_create_folder(service, period_folder_id, brand)
+    return brand_folder_id
+
+
+def _upload_to_drive(filename: str, file_bytes: bytes, brand: str | None = None) -> bool:
+    """가입증명서를 유진님이 지정해둔 구글 드라이브 폴더에 올림. brand가 주어지면 '이번
+    정산기간 폴더 / 브랜드 폴더' 안에, 아니면 지정해둔 폴더 바로 밑에 올림. 그 폴더가
+    유진님 PC의 구글 드라이브 동기화 폴더 안에 있으면, PC에도 자동으로 똑같이 저장됨.
+    설정이 안 돼 있거나 실패하면 조용히 False만 반환(가입증명서 발급 자체는 그대로
+    진행돼야 하므로)."""
     service = _get_gdrive_service()
     if service is None:
         return False
     try:
+        parent_id = GDRIVE_FOLDER_ID
+        if brand:
+            resolved = _resolve_drive_target_folder(service, brand)
+            if resolved:
+                parent_id = resolved
         media = _gdrive_media(file_bytes, mimetype="application/pdf")
         service.files().create(
-            body={"name": filename, "parents": [GDRIVE_FOLDER_ID]},
+            body={"name": filename, "parents": [parent_id]},
             media_body=media,
             fields="id",
         ).execute()
