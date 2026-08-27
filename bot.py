@@ -147,6 +147,17 @@ _CERT_EMAIL_BODY_TEMPLATE = (
     "감사합니다.\n\n"
     "--\n" + _CERT_EMAIL_SIGNATURE
 )
+
+# 같은 담당자 앞으로 신규매장이 여러 곳일 때, 이메일 한 통에 가입증명서를 모두 첨부해서 보낼 때 쓰는 본문.
+# {store_list} 자리에 "- 매장명1\n- 매장명2" 형태로 매장 목록이 자동으로 들어감.
+_CERT_EMAIL_BODY_TEMPLATE_MULTI = (
+    "안녕하십니까.\n\n"
+    "요청해주신 아래 신규 매장 가입증명서를 첨부와 같이 보내드립니다.\n\n"
+    "{store_list}\n\n"
+    "확인 부탁드리며, 문의사항 있으시면 언제든 연락 주시기 바랍니다.\n\n"
+    "감사합니다.\n\n"
+    "--\n" + _CERT_EMAIL_SIGNATURE
+)
 CERT_PAGE_W, CERT_PAGE_H = 595.2, 841.92
 CERT_FONT_SCALE = 4  # 텍스트를 이미지로 그릴 때 선명하게 보이도록 확대 비율
 
@@ -1638,21 +1649,25 @@ def _save_pending_certs(pending: dict) -> None:
         json.dump(pending, f, ensure_ascii=False, indent=2)
 
 
-def _queue_pending_cert(store_name: str, target_email: str, subject: str, body: str, out_name: str, pdf_bytes: bytes) -> str:
-    """가입증명서를 바로 보내지 않고 대기시켜둠. 유진님이 '보내기'를 누르면 그때 실제 발송함."""
+def _queue_pending_certs(items: list, target_email: str, subject: str, body: str) -> str:
+    """가입증명서(한 담당자 앞으로 1건 이상)를 바로 보내지 않고 대기시켜둠.
+    items: [{"store_name":..., "out_name":..., "pdf_bytes":...}, ...]
+    유진님이 '보내기'를 누르면 그때 첨부를 모두 묶어서 실제 발송함."""
     os.makedirs(PENDING_CERTS_DIR, exist_ok=True)
     cert_id = uuid.uuid4().hex[:10]
-    pdf_path = os.path.join(PENDING_CERTS_DIR, f"{cert_id}.pdf")
-    with open(pdf_path, "wb") as f:
-        f.write(pdf_bytes)
+    attachments = []
+    for i, item in enumerate(items):
+        pdf_path = os.path.join(PENDING_CERTS_DIR, f"{cert_id}_{i}.pdf")
+        with open(pdf_path, "wb") as f:
+            f.write(item["pdf_bytes"])
+        attachments.append({"out_name": item["out_name"], "pdf_path": pdf_path})
     pending = _load_pending_certs()
     pending[cert_id] = {
-        "store_name": store_name,
+        "store_names": [item["store_name"] for item in items],
         "target_email": target_email,
         "subject": subject,
         "body": body,
-        "out_name": out_name,
-        "pdf_path": pdf_path,
+        "attachments": attachments,
     }
     _save_pending_certs(pending)
     return cert_id
@@ -1664,10 +1679,11 @@ def _remove_pending_cert(cert_id: str) -> dict | None:
     if entry is None:
         return None
     _save_pending_certs(pending)
-    try:
-        os.remove(entry["pdf_path"])
-    except OSError:
-        pass
+    for a in entry.get("attachments", []):
+        try:
+            os.remove(a["pdf_path"])
+        except OSError:
+            pass
     return entry
 
 
@@ -1694,28 +1710,32 @@ async def handle_cert_confirmation(update: Update, context: ContextTypes.DEFAULT
 
     if action == "sendcert":
         await query.answer()
+        names_text = ", ".join(entry["store_names"])
         try:
-            with open(entry["pdf_path"], "rb") as f:
-                pdf_bytes = f.read()
+            mail_attachments = []
+            for a in entry["attachments"]:
+                with open(a["pdf_path"], "rb") as f:
+                    mail_attachments.append((a["out_name"], f.read()))
             _send_email(
                 entry["target_email"],
                 subject=entry["subject"],
                 body=entry["body"],
-                attachments=[(entry["out_name"], pdf_bytes)],
+                attachments=mail_attachments,
             )
             _remove_pending_cert(cert_id)
-            await query.edit_message_text(f"✅ '{entry['store_name']}' 가입증명서를 {entry['target_email']}로 보냈어요.")
+            await query.edit_message_text(f"✅ '{names_text}' 가입증명서를 {entry['target_email']}로 보냈어요.")
         except Exception:
             logger.exception("대기 중이던 가입증명서 발송 중 오류")
-            await query.edit_message_text(f"⚠️ '{entry['store_name']}' 가입증명서 발송에 실패했어요. 이 메시지에서 다시 눌러 시도해주세요.")
+            await query.edit_message_text(f"⚠️ '{names_text}' 가입증명서 발송에 실패했어요. 이 메시지에서 다시 눌러 시도해주세요.")
     elif action == "holdcert":
         # 메시지와 버튼을 그대로 남겨둠 -> 명령어 없이도, 나중에 이 메시지를 찾아 스크롤해서
         # 그냥 다시 '보내기'를 누르기만 하면 됨. 살짝 알려주는 팝업만 띄우고 메시지는 안 건드림.
         await query.answer("⏸ 대기 상태예요. 나중에 이 메시지에서 다시 눌러 보내시면 돼요.", show_alert=True)
     elif action == "cancelcert":
         await query.answer()
+        names_text = ", ".join(entry["store_names"])
         _remove_pending_cert(cert_id)
-        await query.edit_message_text(f"🗑 '{entry['store_name']}' 가입증명서 발송을 취소했어요.")
+        await query.edit_message_text(f"🗑 '{names_text}' 가입증명서 발송을 취소했어요.")
 
 
 async def list_pending_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1730,8 +1750,9 @@ async def list_pending_command(update: Update, context: ContextTypes.DEFAULT_TYP
             InlineKeyboardButton("✅ 보내기", callback_data=f"sendcert:{cert_id}"),
             InlineKeyboardButton("🗑 취소", callback_data=f"cancelcert:{cert_id}"),
         ]])
+        names_text = ", ".join(entry["store_names"])
         await update.message.reply_text(
-            f"'{entry['store_name']}' → {entry['target_email']}",
+            f"'{names_text}' → {entry['target_email']}",
             reply_markup=keyboard,
         )
 
@@ -2199,9 +2220,11 @@ async def _sync_and_notify(
 
     ended_stores = []
     no_contact_stores = []
-    queued_stores = []
+    queued_groups = []
     drive_saved = 0
     contacts = _load_contacts()
+    # target_email -> {"received_by": str, "items": [{"store_name","out_name","pdf_bytes"}, ...]}
+    cert_groups: dict[str, dict] = {}
     for store in result["new_stores"]:
         # 보험종기일이 이미 지난 건은 통합파일엔 기록해두되, 가입증명서는 만들지 않음(사용자 요청)
         if store.get("period_ended"):
@@ -2223,8 +2246,9 @@ async def _sync_and_notify(
         )
 
         # 담당자에게 이메일로 보낼지: 메일로 들어온 건이면 그 발신 주소로, 텔레그램으로
-        # 직접 올린 건이면 엑셀 '접수자' 이름으로 등록된 연락처를 찾음. 바로 보내지 않고
-        # 유진님이 버튼으로 확인한 뒤에 실제 발송함(원치 않으면 '대기' 선택 가능)
+        # 직접 올린 건이면 엑셀 '접수자' 이름으로 등록된 연락처를 찾음. 같은 담당자 앞으로
+        # 신규매장이 여러 곳이면 메일을 여러 통 나눠 보내지 않고, 한 번에 묶어서 보냄.
+        # 바로 보내지 않고 유진님이 버튼으로 확인한 뒤에 실제 발송함(원치 않으면 '대기' 선택 가능)
         target_email = requester_email
         received_by = store.get("received_by") or ""
         if not target_email and received_by:
@@ -2237,34 +2261,50 @@ async def _sync_and_notify(
                 if contacts.get(key) != requester_email:
                     contacts[key] = requester_email
                     _save_contacts(contacts)
-            cert_id = _queue_pending_cert(
-                store_name=store["store_name"],
-                target_email=target_email,
-                subject=f"[{brand}] {store['store_name']} 가입증명서",
-                body=_CERT_EMAIL_BODY_TEMPLATE.format(store_name=store["store_name"]),
-                out_name=out_name,
-                pdf_bytes=pdf_bytes,
-            )
-            queued_stores.append((store["store_name"], target_email))
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ 보내기", callback_data=f"sendcert:{cert_id}"),
-                InlineKeyboardButton("⏸ 대기", callback_data=f"holdcert:{cert_id}"),
-                InlineKeyboardButton("🗑 취소", callback_data=f"cancelcert:{cert_id}"),
-            ]])
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"담당자 {received_by or target_email}님에게 '{store['store_name']}' 가입증명서를 보낼까요?\n"
-                    "(대기를 누르면 이 메시지는 그대로 남아있으니, 나중에 다시 여기서 보내기를 누르시면 돼요)"
-                ),
-                reply_markup=keyboard,
-            )
+            group = cert_groups.setdefault(target_email, {"received_by": "", "items": []})
+            if received_by and not group["received_by"]:
+                group["received_by"] = received_by
+            group["items"].append({
+                "store_name": store["store_name"],
+                "out_name": out_name,
+                "pdf_bytes": pdf_bytes,
+            })
         elif received_by:
             no_contact_stores.append(received_by)
 
         # 구글 드라이브(설정해뒀으면 유진님 PC에 자동 동기화)에도 저장
         if _upload_to_drive(out_name, pdf_bytes):
             drive_saved += 1
+
+    for target_email, group in cert_groups.items():
+        items = group["items"]
+        store_names = [item["store_name"] for item in items]
+        received_by = group["received_by"]
+        if len(items) == 1:
+            subject = f"[{brand}] {store_names[0]} 가입증명서"
+            body = _CERT_EMAIL_BODY_TEMPLATE.format(store_name=store_names[0])
+            confirm_text = f"담당자 {received_by or target_email}님에게 '{store_names[0]}' 가입증명서를 보낼까요?"
+        else:
+            subject = f"[{brand}] 신규매장 가입증명서 ({len(items)}건)"
+            store_list = "\n".join(f"- {name}" for name in store_names)
+            body = _CERT_EMAIL_BODY_TEMPLATE_MULTI.format(store_list=store_list)
+            names_text = ", ".join(store_names)
+            confirm_text = f"담당자 {received_by or target_email}님에게 신규매장 {len(items)}건({names_text}) 가입증명서를 한번에 보낼까요?"
+        cert_id = _queue_pending_certs(items, target_email=target_email, subject=subject, body=body)
+        queued_groups.append((store_names, target_email))
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ 보내기", callback_data=f"sendcert:{cert_id}"),
+            InlineKeyboardButton("⏸ 대기", callback_data=f"holdcert:{cert_id}"),
+            InlineKeyboardButton("🗑 취소", callback_data=f"cancelcert:{cert_id}"),
+        ]])
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                confirm_text + "\n"
+                "(대기를 누르면 이 메시지는 그대로 남아있으니, 나중에 다시 여기서 보내기를 누르시면 돼요)"
+            ),
+            reply_markup=keyboard,
+        )
 
     if ended_stores:
         lines = "\n".join(f"- {s['store_name']}({s['store_code']}) 종기일 {s['end_date']}" for s in ended_stores)
@@ -2279,8 +2319,8 @@ async def _sync_and_notify(
     summary = f"✅ '{brand}' 통합파일을 갱신했어요.\n신규 매장 {len(result['new_stores'])}곳"
     if result["closed_count"]:
         summary += f", 폐점 매장 {result['closed_count']}곳"
-    if queued_stores:
-        queued_lines = "\n".join(f"  - {name} → {addr}" for name, addr in queued_stores)
+    if queued_groups:
+        queued_lines = "\n".join(f"  - {', '.join(names)} → {addr}" for names, addr in queued_groups)
         summary += f"\n📧 담당자 발송 확인 대기 중(위 버튼 눌러주세요):\n{queued_lines}"
     if drive_saved:
         summary += f"\n💾 구글 드라이브에도 {drive_saved}건 저장했어요."
