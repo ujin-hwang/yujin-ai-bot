@@ -4,6 +4,7 @@ import re
 import json
 import copy
 import uuid
+import base64
 import zipfile
 import asyncio
 import datetime as dt
@@ -2125,6 +2126,9 @@ def _sync_brand_excel(file_bytes: bytes) -> dict | None:
             template_row = _find_template_row(master_ws, master_header, master_min_row, target_row)
             _write_row(master_ws, master_header, target_row, vals, template_row)
             closed_count += 1
+            # 이 행이 통합파일의 '폐점매장' 시트에 그대로 저장되므로(_write_row), 이 매장이
+            # '신규매장'으로 기록된 적이 없어도 나중에 _all_closed_store_rows()로 브랜드/
+            # 대표자명을 다시 찾을 수 있음(별도 저장소 없이 통합파일 자체가 정보 출처).
             closed_stores.append({
                 "store_name": str(vals.get("매장명") or "").strip(),
                 "owner_name": str(vals.get("대표자명") or "").strip(),
@@ -2436,8 +2440,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     # 폐점필수서류로 보이는 파일(파일명에 사업자등록증/신분증/통장사본/개인정보 키워드가 있음)이면,
-    # 명령어 없이 바로 파일명에서 매장을 찾아 자동으로 모으고 4종류가 다 모이면 압축해서 저장함
-    if _classify_closure_doc(filename) is not None:
+    # 명령어 없이 바로 파일명에서 매장을 찾아 자동으로 모으고 4종류가 다 모이면 압축해서 저장함.
+    # 파일명에 단서가 없어도(예: 'OL인천구월점_251112.pdf'), 지금 이미 폐점서류를 모으고 있는
+    # 중이면(closure_buffers 진행 중) 파일을 직접 열어서(PDF 텍스트 -> Claude 비전) 확인함.
+    closure_category = _classify_closure_doc(filename)
+    is_doc_like = filename.lower().endswith((".pdf", ".jpg", ".jpeg", ".png"))
+    has_active_closure_context = bool(
+        context.user_data.get("closure_buffers") or context.user_data.get("awaiting_closure_store_for")
+    )
+    if closure_category is not None or (is_doc_like and has_active_closure_context):
         try:
             tg_file = await doc.get_file()
             file_bytes = bytes(await tg_file.download_as_bytearray())
@@ -2445,25 +2456,36 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             logger.exception("폐점서류 파일 다운로드 중 오류")
             await update.message.reply_text("파일을 받아오는 중 오류가 발생했어요. 다시 보내주세요.")
             return
-        await _handle_closure_doc_upload(update, context, filename, file_bytes)
-        return
+        if closure_category is None:
+            closure_category = await _classify_closure_doc_deep(filename, file_bytes)
+        if closure_category is not None:
+            await _handle_closure_doc_upload(update, context, filename, file_bytes, category=closure_category)
+            return
+        if has_active_closure_context:
+            await update.message.reply_text(
+                f"'{filename}' 파일 내용을 확인해봤는데, 폐점필수서류(사업자등록증/신분증/통장사본/"
+                "개인정보동의서) 중 어디에도 해당하지 않는 것 같아요. 다른 파일이면 다시 보내주세요."
+            )
+            return
+        # 명확한 폐점서류도 아니고 진행 중인 수집도 없으면 아래 일반 처리로 계속 진행
 
     # 유진님이 매장별로 미리 압축해서 올리는 zip 파일이면, 파일명에서 등록된 매장을 찾아
     # 그대로(폐점필수서류 4종류가 안에 다 있는지 확인 후) 드라이브에 저장함
     if filename.lower().endswith(".zip"):
         store_index = _all_registered_store_rows()
+        known_names = (
+            set(store_index.keys())
+            | set(_all_closed_store_rows().keys())
+            | set(_all_initial_list_store_rows().keys())
+        )
         norm_fname = re.sub(r"\s+", "", filename)
         matched_name = None
-        for name in store_index:
+        for name in known_names:
             if any(cand and cand in norm_fname for cand in _closure_store_name_candidates(name)):
                 matched_name = name
                 break
         if matched_name:
-            entries = store_index[matched_name]
-            entries.sort(key=lambda e: _parse_date_val(e["vals"].get("접수일자")) or dt.date.min, reverse=True)
-            chosen = entries[0]
-            brand = chosen["brand"]
-            owner_name = str(chosen["vals"].get("대표자명") or "").strip()
+            matched_name, brand, owner_name = _resolve_closure_store(matched_name, store_index)
             try:
                 tg_file = await doc.get_file()
                 file_bytes = bytes(await tg_file.download_as_bytearray())
@@ -2736,9 +2758,10 @@ async def mail_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-def _all_registered_store_rows() -> dict:
-    """등록된 모든 브랜드의 '신규매장' 시트를 다 뒤져서, 매장명 -> 그 매장이 있던 행(들) 정보를
-    모아둠. '가입증명서를 다시 만들어줘' 같은 요청이 오면 여기서 검색해서 다시 만듦."""
+def _all_store_rows_by_sheet_type(sheet_type: str) -> dict:
+    """등록된 모든 브랜드의 통합파일에서 지정한 종류(예: '신규매장'/'폐점매장') 시트를 다 뒤져서,
+    매장명 -> 그 매장이 있던 행(들) 정보를 모아둠. 통합파일이 유일한 정보 출처가 되도록,
+    신규매장 조회/폐점서류 매칭 둘 다 이 함수 하나로 통일함."""
     result: dict[str, list[dict]] = {}
     if not os.path.isdir(MASTERS_DIR):
         return result
@@ -2752,10 +2775,10 @@ def _all_registered_store_rows() -> dict:
             wb_values = openpyxl.load_workbook(path, data_only=True)
         except Exception:
             continue
-        new_sheets = _find_type_sheets(wb, "신규매장")
-        new_sheets_values = _find_type_sheets(wb_values, "신규매장")
-        for sub_type, ws in new_sheets.items():
-            ws_values = new_sheets_values.get(sub_type)
+        sheets = _find_type_sheets(wb, sheet_type)
+        sheets_values = _find_type_sheets(wb_values, sheet_type)
+        for sub_type, ws in sheets.items():
+            ws_values = sheets_values.get(sub_type)
             if ws_values is None:
                 continue
             header, min_row = _build_header_map(ws)
@@ -2777,6 +2800,28 @@ def _all_registered_store_rows() -> dict:
                         "rate2": rate2,
                     })
     return result
+
+
+def _all_registered_store_rows() -> dict:
+    """등록된 모든 브랜드의 '신규매장' 시트를 다 뒤져서, 매장명 -> 그 매장이 있던 행(들) 정보를
+    모아둠. '가입증명서를 다시 만들어줘' 같은 요청이 오면 여기서 검색해서 다시 만듦."""
+    return _all_store_rows_by_sheet_type("신규매장")
+
+
+def _all_closed_store_rows() -> dict:
+    """등록된 모든 브랜드의 '폐점매장' 시트를 다 뒤져서, 매장명 -> 그 매장이 있던 행(들) 정보를
+    모아둠. 그 매장이 '신규매장'으로 기록된 적이 없어도(봇 도입 전부터 있던 매장 등), 폐점
+    처리되는 순간 통합파일의 '폐점매장' 시트에 이미 기록되므로, 폐점서류를 매장에 매칭시킬
+    때(브랜드/대표자명 확인용) 여기서 찾음. 통합파일 자체가 유일한 정보 출처임(별도 저장 안 함)."""
+    return _all_store_rows_by_sheet_type("폐점매장")
+
+
+def _all_initial_list_store_rows() -> dict:
+    """등록된 모든 브랜드의 '최초가입전체리스트' 시트를 다 뒤져서, 매장명 -> 그 매장이 있던
+    행(들) 정보를 모아둠. 봇이 신규/폐점매장으로 한 번도 기록한 적 없는(정말 오래 전부터
+    있던) 매장도 이 시트에는 원래 다 있는 경우가 많아서(유진님 요청), 폐점서류 매칭 시
+    마지막 대체 조회 소스로 씀."""
+    return _all_store_rows_by_sheet_type("최초가입전체리스트")
 
 
 _CERT_LOOKUP_RE = re.compile(r"가입\s*증명서")
@@ -2857,6 +2902,28 @@ def _find_registered_store(store_name: str, store_index: dict):
     return None, None
 
 
+def _resolve_closure_store(store_name: str, store_index: dict):
+    """폐점서류를 매장에 매칭시킬 때 필요한 브랜드/대표자명을 찾음. 순서대로 찾아봄:
+    1) '신규매장' 시트로 등록된 기록(_find_registered_store)
+    2) 통합파일의 '폐점매장' 시트(폐점 처리되는 순간 이미 거기 기록되므로)
+    3) 통합파일의 '최초가입전체리스트' 시트(봇이 신규/폐점매장으로 한 번도 기록한 적 없는
+       아주 오래된 매장도 원래 여기엔 있는 경우가 많음 - 유진님 요청)
+    셋 다 통합파일 자체가 정보 출처이고 별도 저장소는 두지 않음.
+    (매장명, 브랜드, 대표자명) 튜플을 반환하거나, 끝까지 못 찾으면 (None, None, None)."""
+    name, entries = _find_registered_store(store_name, store_index)
+    if not entries:
+        name, entries = _find_registered_store(store_name, _all_closed_store_rows())
+    if not entries:
+        name, entries = _find_registered_store(store_name, _all_initial_list_store_rows())
+    if not entries:
+        return None, None, None
+    entries = sorted(
+        entries, key=lambda e: _parse_date_val(e["vals"].get("접수일자")) or dt.date.min, reverse=True
+    )
+    chosen = entries[0]
+    return name, chosen["brand"], str(chosen["vals"].get("대표자명") or "").strip()
+
+
 def _classify_closure_doc(filename: str) -> str | None:
     """파일명만 보고 폐점필수서류 4종류 중 뭔지 알아냄(모르면 None). handle_document에서
     '이 파일이 폐점서류로 보이는지' 먼저 가볍게 판단하는 데 씀."""
@@ -2866,14 +2933,8 @@ def _classify_closure_doc(filename: str) -> str | None:
     return None
 
 
-def _start_closure_buffer(buffers: dict, store_name: str, entries: list) -> dict:
-    entries.sort(key=lambda e: _parse_date_val(e["vals"].get("접수일자")) or dt.date.min, reverse=True)
-    chosen = entries[0]
-    buf = {
-        "brand": chosen["brand"],
-        "owner_name": str(chosen["vals"].get("대표자명") or "").strip(),
-        "matched": {},
-    }
+def _start_closure_buffer(buffers: dict, store_name: str, brand: str, owner_name: str) -> dict:
+    buf = {"brand": brand, "owner_name": owner_name or "", "matched": {}}
     buffers[store_name] = buf
     return buf
 
@@ -2894,18 +2955,31 @@ async def _finish_closure_buffer(update: Update, store_name: str, buf: dict) -> 
         await update.message.reply_text("⚠️ 서류는 다 모았는데 구글 드라이브 저장에 실패했어요. 드라이브 설정을 확인해주세요.")
 
 
-async def _handle_closure_doc_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, filename: str, file_bytes: bytes) -> None:
+async def _handle_closure_doc_upload(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, filename: str, file_bytes: bytes,
+    category: str | None = None,
+) -> None:
     """폐점필수서류로 보이는 파일이 명령어 없이 그냥 올라왔을 때 처리함. 파일명에서 등록된
     매장을 바로 찾아서 자동으로 모으고(여러 매장 동시 진행 가능), 매장당 4종류가 다 모이면
     바로 압축해서 드라이브에 저장함. 파일명에 매장명이 없으면(예: 개인정보동의서), 지금 막
-    모으고 있는 매장이 하나뿐일 때만 그 매장 걸로 간주하고, 여러 개/없음이면 매장명을 물어봄."""
-    category = _classify_closure_doc(filename)
+    모으고 있는 매장이 하나뿐일 때만 그 매장 걸로 간주하고, 여러 개/없음이면 매장명을 물어봄.
+    category를 호출부에서 미리 판단해서 넘겨줄 수도 있음(파일명으로 못 알아봐서 내용을
+    직접 열어서 확인한 경우)."""
+    if category is None:
+        category = _classify_closure_doc(filename)
     buffers = context.user_data.setdefault("closure_buffers", {})
     store_index = _all_registered_store_rows()
+    # 신규매장으로 기록된 적 없는(봇 도입 전부터 있던) 매장도 파일명 매칭 대상에 포함하기 위해,
+    # 통합파일의 '폐점매장'/'최초가입전체리스트' 시트에 있는 이름도 후보에 같이 넣음
+    known_names = (
+        set(store_index.keys())
+        | set(_all_closed_store_rows().keys())
+        | set(_all_initial_list_store_rows().keys())
+    )
 
     norm_fname = re.sub(r"\s+", "", filename)
     matched_name = None
-    for name in store_index:
+    for name in known_names:
         if any(cand and cand in norm_fname for cand in _closure_store_name_candidates(name)):
             matched_name = name
             break
@@ -2928,11 +3002,12 @@ async def _handle_closure_doc_upload(update: Update, context: ContextTypes.DEFAU
             return
 
     if matched_name not in buffers:
-        entries = store_index.get(matched_name) or []
-        if not entries:
+        resolved_name, brand, owner_name = _resolve_closure_store(matched_name, store_index)
+        if not resolved_name:
             await update.message.reply_text(f"⚠️ '{matched_name}' 매장을 등록된 매장 목록에서 찾지 못했어요.")
             return
-        _start_closure_buffer(buffers, matched_name, entries)
+        _start_closure_buffer(buffers, resolved_name, brand, owner_name)
+        matched_name = resolved_name
 
     buf = buffers[matched_name]
     buf["matched"][category] = (filename, file_bytes)
@@ -2977,8 +3052,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if awaiting:
         filename, file_bytes, category = awaiting
         store_index = _all_registered_store_rows()
-        store_name, entries = _find_registered_store(user_text.strip(), store_index)
-        if not entries:
+        store_name, brand, owner_name = _resolve_closure_store(user_text.strip(), store_index)
+        if not store_name:
             await update.message.reply_text(
                 f"'{user_text.strip()}' 매장을 찾지 못했어요. 등록된 매장명을 정확히 다시 알려주시겠어요?"
             )
@@ -2986,7 +3061,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data.pop("awaiting_closure_store_for", None)
         buffers = context.user_data.setdefault("closure_buffers", {})
         if store_name not in buffers:
-            _start_closure_buffer(buffers, store_name, entries)
+            _start_closure_buffer(buffers, store_name, brand, owner_name)
         buf = buffers[store_name]
         buf["matched"][category] = (filename, file_bytes)
         n = len(buf["matched"])
@@ -3203,6 +3278,115 @@ _CLOSURE_DOC_KEYWORDS = {
     "개인정보동의서": ["개인정보"],
 }
 
+# 파일명만으로 못 알아본 서류(예: 'OL인천구월점_251112.pdf'처럼 키워드가 전혀 없는 이름)를,
+# 문서 내용을 직접 열어서 확인할 때 쓰는 텍스트 단서. PDF는 먼저 이 키워드로 확인하고(텍스트가
+# 있으면 API 호출 없이 바로 판단 가능), 안 되면(스캔본 PDF나 사진) Claude에게 실제 내용을
+# 보여주고 판단시킴(유진님 요청: "파일을 다 열어서 파악해보고 없는 서류를 알려줘").
+_CLOSURE_DOC_CONTENT_HINTS = {
+    "사업자등록증": ["사업자등록증", "사업자등록번호", "개업연월일", "법인등록번호"],
+    "신분증": ["주민등록증", "운전면허증", "주민등록번호"],
+    "통장사본": ["예금주", "계좌번호", "보통예금", "예금거래통장"],
+    "개인정보동의서": ["개인정보", "동의서"],
+}
+
+
+def _extract_pdf_text(file_bytes: bytes) -> str:
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        return "\n".join((page.extract_text() or "") for page in reader.pages)
+    except Exception:
+        return ""
+
+
+def _classify_by_content_text(text: str) -> str | None:
+    if not text:
+        return None
+    for category, hints in _CLOSURE_DOC_CONTENT_HINTS.items():
+        if any(h in text for h in hints):
+            return category
+    return None
+
+
+async def _classify_doc_with_claude(filename: str, file_bytes: bytes, mimetype: str) -> str | None:
+    """파일명/텍스트로 못 알아본 서류를 실제 내용(이미지 또는 PDF)을 Claude에게 직접 보여주고
+    폐점필수서류 4종류 중 무엇인지 판단시킴. 어디에도 해당 안 되면 None."""
+    b64 = base64.b64encode(file_bytes).decode()
+    if mimetype == "application/pdf":
+        content_block = {
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": b64},
+        }
+    else:
+        content_block = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": mimetype, "data": b64},
+        }
+    try:
+        response = client.messages.create(
+            model=MODEL_NAME,
+            max_tokens=20,
+            system=(
+                "첨부된 문서 이미지/파일이 '사업자등록증', '신분증'(주민등록증 또는 운전면허증), "
+                "'통장사본'(예금계좌 확인서 포함), '개인정보동의서' 중 어떤 것인지 정확히 그 이름 "
+                "하나만 답하세요. 네 가지 중 어디에도 해당하지 않으면 정확히 NONE이라고만 답하세요. "
+                "다른 설명은 절대 하지 마세요."
+            ),
+            messages=[{
+                "role": "user",
+                "content": [content_block, {"type": "text", "text": f"파일명: {filename}"}],
+            }],
+        )
+        raw = "".join(b.text for b in response.content if b.type == "text").strip()
+        return raw if raw in _CLOSURE_DOC_KEYWORDS else None
+    except Exception:
+        logger.exception("문서 내용 분류 중 오류")
+        return None
+
+
+async def _classify_closure_doc_deep(filename: str, file_bytes: bytes) -> str | None:
+    """파일명으로 먼저 판단하고(_classify_closure_doc), 안 되면 문서 내용을 직접 열어서
+    (PDF면 텍스트 추출 -> 그래도 안 되면 Claude 비전) 폐점필수서류 4종류 중 어느 것인지 알아냄.
+    확장자가 pdf/jpg/jpeg/png가 아니면 애초에 폐점서류일 가능성이 낮아 바로 None."""
+    by_name = _classify_closure_doc(filename)
+    if by_name:
+        return by_name
+    lower = filename.lower()
+    if lower.endswith(".pdf"):
+        text = _extract_pdf_text(file_bytes)
+        by_text = _classify_by_content_text(text)
+        if by_text:
+            return by_text
+        mimetype = "application/pdf"
+    elif lower.endswith((".jpg", ".jpeg")):
+        mimetype = "image/jpeg"
+    elif lower.endswith(".png"):
+        mimetype = "image/png"
+    else:
+        return None
+    return await _classify_doc_with_claude(filename, file_bytes, mimetype)
+
+
+async def _match_closure_docs_with_content(
+    store_name: str, attachments: list, allow_no_name_fallback: bool = False
+) -> dict:
+    """_match_closure_docs로 먼저 파일명 기준으로 매칭하고, 그래도 4종류가 안 채워지면 아직
+    아무 카테고리에도 안 쓰인 첨부파일들을 직접 열어서(내용 기반) 다시 확인함. 파일명이
+    'OL인천구월점_251112.pdf'처럼 아무 단서가 없는 경우를 위한 보강."""
+    matched = _match_closure_docs(store_name, attachments, allow_no_name_fallback=allow_no_name_fallback)
+    if len(matched) >= 4:
+        return matched
+    used_filenames = {fn for fn, _fb in matched.values()}
+    for filename, file_bytes in attachments:
+        if len(matched) >= 4:
+            break
+        if filename in used_filenames or not filename.lower().endswith((".pdf", ".jpg", ".jpeg", ".png")):
+            continue
+        category = await _classify_closure_doc_deep(filename, file_bytes)
+        if category and category not in matched:
+            matched[category] = (filename, file_bytes)
+            used_filenames.add(filename)
+    return matched
+
 
 def _closure_store_name_candidates(store_name: str) -> set:
     norm_store = re.sub(r"\s+", "", store_name)
@@ -3379,6 +3563,8 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
                         if not store_name:
                             continue
                         zip_name = _closure_zip_name(store_name, owner_name)
+                        saved = False
+                        missing = None
                         try:
                             # 1) 유진님이 이미 매장별로 압축해서 보낸 zip이 있으면 그걸 그대로 씀
                             existing_zip = _find_store_zip_attachment(store_name, other_attachments)
@@ -3388,24 +3574,46 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
                                     extra_subfolder="폐점서류", mimetype="application/zip",
                                 )
                             else:
-                                # 2) 나열된 개별 첨부파일에서 4종류를 찾아 직접 압축
-                                matched = _match_closure_docs(
+                                # 2) 나열된 개별 첨부파일에서 4종류를 찾아 직접 압축(파일명으로 안
+                                # 되면 내용을 직접 열어서도 확인함 - 예: 'OL인천구월점_251112.pdf')
+                                matched = await _match_closure_docs_with_content(
                                     store_name, other_attachments, allow_no_name_fallback=allow_fallback
                                 )
                                 if len(matched) < 4:
-                                    continue
-                                zip_bytes = _zip_closure_docs(matched)
-                                saved = _upload_to_drive(
-                                    zip_name, zip_bytes, brand=brand,
-                                    extra_subfolder="폐점서류", mimetype="application/zip",
-                                )
+                                    missing = [c for c in _CLOSURE_DOC_KEYWORDS if c not in matched]
+                                else:
+                                    zip_bytes = _zip_closure_docs(matched)
+                                    saved = _upload_to_drive(
+                                        zip_name, zip_bytes, brand=brand,
+                                        extra_subfolder="폐점서류", mimetype="application/zip",
+                                    )
                         except Exception:
                             logger.exception("폐점서류 압축/저장 중 오류")
                             saved = False
+                        # 성공/실패/서류 부족 여부를 항상 알려드림(예전엔 성공했을 때만 알려드려서,
+                        # 저장이 안 됐을 때 유진님이 알 방법이 없었음 — 유진님 피드백으로 추가).
                         if saved:
                             await context.bot.send_message(
                                 chat_id=ALLOWED_USER_ID,
                                 text=f"💾 '{zip_name}' 로 폐점서류를 구글 드라이브에 저장했어요.",
+                            )
+                        elif missing is not None:
+                            await context.bot.send_message(
+                                chat_id=ALLOWED_USER_ID,
+                                text=(
+                                    f"⚠️ '{store_name}' 폐점 처리는 됐는데, 이 메일 첨부파일만으로는 "
+                                    f"폐점필수서류가 다 안 갖춰져서 구글 드라이브에는 저장하지 못했어요. "
+                                    f"(부족한 서류: {', '.join(missing)}) 나머지 서류를 받으시면 봇에 파일로 "
+                                    "그냥 올려주세요. 자동으로 나머지랑 합쳐서 저장해드려요."
+                                ),
+                            )
+                        else:
+                            await context.bot.send_message(
+                                chat_id=ALLOWED_USER_ID,
+                                text=(
+                                    f"❌ '{zip_name}' 구글 드라이브 저장에 실패했어요. "
+                                    "드라이브 연결 설정(GDRIVE_SERVICE_ACCOUNT_JSON / GDRIVE_FOLDER_ID)을 확인해주세요."
+                                ),
                             )
 
         last_uid_seen = latest_uid
