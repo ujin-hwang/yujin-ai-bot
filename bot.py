@@ -2236,6 +2236,7 @@ async def _sync_and_notify(
     no_contact_stores = []
     queued_groups = []
     drive_saved = 0
+    drive_failed_stores = []
     contacts = _load_contacts()
     # target_email -> {"received_by": str, "items": [{"store_name","out_name","pdf_bytes"}, ...]}
     cert_groups: dict[str, dict] = {}
@@ -2289,6 +2290,8 @@ async def _sync_and_notify(
         # 구글 드라이브(설정해뒀으면 유진님 PC에 자동 동기화)에도 저장
         if _upload_to_drive(out_name, pdf_bytes, brand=brand):
             drive_saved += 1
+        else:
+            drive_failed_stores.append(store["store_name"])
 
     for target_email, group in cert_groups.items():
         items = group["items"]
@@ -2338,6 +2341,11 @@ async def _sync_and_notify(
         summary += f"\n📧 담당자 발송 확인 대기 중(위 버튼 눌러주세요):\n{queued_lines}"
     if drive_saved:
         summary += f"\n💾 구글 드라이브에도 {drive_saved}건 저장했어요."
+    if drive_failed_stores:
+        summary += (
+            f"\n❌ 구글 드라이브 저장 실패: {', '.join(drive_failed_stores)} "
+            "(드라이브 연결 설정을 확인해주세요. 텔레그램으로는 정상적으로 받으셨을 거예요)"
+        )
     await bot.send_message(chat_id=chat_id, text=summary)
 
     if no_contact_stores:
