@@ -29,12 +29,16 @@ from reportlab.lib.utils import ImageReader
 from pypdf import PdfReader, PdfWriter
 
 try:
-    # 구글 드라이브 자동 업로드용(설정 안 해두면 그냥 이 기능만 꺼짐)
-    from google.oauth2 import service_account as _gdrive_service_account
+    # 구글 드라이브 자동 업로드용(설정 안 해두면 그냥 이 기능만 꺼짐).
+    # 서비스 계정은 개인 "내 드라이브"에는 저장 용량이 아예 없어서(구글 정책상 제약,
+    # storageQuotaExceeded 오류) 유진님 개인 계정 권한으로 직접 올리는 OAuth 방식을 씀.
+    from google.oauth2.credentials import Credentials as _gdrive_user_credentials
+    from google.auth.transport.requests import Request as _gdrive_auth_request
     from googleapiclient.discovery import build as _gdrive_build
     from googleapiclient.http import MediaInMemoryUpload as _gdrive_media
 except ImportError:
-    _gdrive_service_account = None
+    _gdrive_user_credentials = None
+    _gdrive_auth_request = None
     _gdrive_build = None
     _gdrive_media = None
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -73,9 +77,12 @@ MAIL_REPLY_TO = os.environ.get("MAIL_REPLY_TO", MAIL_FROM_ADDRESS)
 MODEL_NAME = os.environ.get("MODEL_NAME", "claude-haiku-4-5-20251001")
 
 # 가입증명서를 구글 드라이브(유진님 PC에 동기화된 폴더)에도 자동으로 올려주는 기능용 설정.
-# 서비스 계정 방식이라 유진님이 매번 로그인/인증할 필요 없이, 처음에 딱 한 번 그 서비스
-# 계정한테 드라이브 폴더 하나를 "공유"만 해두면 계속 자동으로 파일을 넣어줌.
-GDRIVE_SERVICE_ACCOUNT_JSON = os.environ.get("GDRIVE_SERVICE_ACCOUNT_JSON")
+# 유진님의 개인 구글 계정(bubal5503@gmail.com) 권한으로 직접 올리는 OAuth 방식. 처음 한 번만
+# 유진님이 로그인/동의해서 refresh token을 받아두면, 이후로는 그 토큰으로 계속 자동 갱신하며
+# 접속해서 유진님 계정의 "내 드라이브" 용량으로 파일을 저장함(서비스 계정은 이게 안 됨).
+GDRIVE_OAUTH_CLIENT_ID = os.environ.get("GDRIVE_OAUTH_CLIENT_ID")
+GDRIVE_OAUTH_CLIENT_SECRET = os.environ.get("GDRIVE_OAUTH_CLIENT_SECRET")
+GDRIVE_OAUTH_REFRESH_TOKEN = os.environ.get("GDRIVE_OAUTH_REFRESH_TOKEN")
 GDRIVE_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID")
 
 # 카카오 REST API 키 (카카오맵 대중교통/도보/자전거 길찾기 + 카카오모빌리티 자동차 길찾기 공용)
@@ -2582,19 +2589,29 @@ _gdrive_service = None  # 매번 새로 로그인하지 않도록 한 번 만든
 
 
 def _get_gdrive_service():
-    """구글 드라이브 서비스 계정 클라이언트를 만들어서 반환함(설정 안 돼있으면 None).
-    유진님이 미리 이 서비스 계정한테 특정 드라이브 폴더를 '공유'해둬야, 그 폴더 안에
-    파일을 넣을 수 있음(유진님 로그인/인증 절차 없이 서버에서 바로 동작)."""
+    """구글 드라이브 클라이언트를 만들어서 반환함(설정 안 돼있으면 None).
+    서비스 계정은 개인 '내 드라이브'에 저장 용량이 없어서 못 쓰고(storageQuotaExceeded),
+    유진님 개인 계정(bubal5503@gmail.com)의 OAuth refresh token으로 인증함 - 그 계정의
+    드라이브 용량을 그대로 씀. refresh token은 처음 한 번만 발급받아 Render 환경변수에
+    저장해두면, access token은 만료될 때마다 이 코드가 자동으로 갱신함(재로그인 불필요)."""
     global _gdrive_service
     if _gdrive_service is not None:
         return _gdrive_service
-    if not (GDRIVE_SERVICE_ACCOUNT_JSON and GDRIVE_FOLDER_ID and _gdrive_build):
+    if not (
+        GDRIVE_OAUTH_CLIENT_ID and GDRIVE_OAUTH_CLIENT_SECRET and GDRIVE_OAUTH_REFRESH_TOKEN
+        and GDRIVE_FOLDER_ID and _gdrive_build
+    ):
         return None
     try:
-        info = json.loads(GDRIVE_SERVICE_ACCOUNT_JSON)
-        creds = _gdrive_service_account.Credentials.from_service_account_info(
-            info, scopes=["https://www.googleapis.com/auth/drive"]
+        creds = _gdrive_user_credentials(
+            token=None,
+            refresh_token=GDRIVE_OAUTH_REFRESH_TOKEN,
+            client_id=GDRIVE_OAUTH_CLIENT_ID,
+            client_secret=GDRIVE_OAUTH_CLIENT_SECRET,
+            token_uri="https://oauth2.googleapis.com/token",
+            scopes=["https://www.googleapis.com/auth/drive"],
         )
+        creds.refresh(_gdrive_auth_request())
         _gdrive_service = _gdrive_build("drive", "v3", credentials=creds)
         return _gdrive_service
     except Exception:
@@ -3620,7 +3637,7 @@ async def check_new_mail(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 chat_id=ALLOWED_USER_ID,
                                 text=(
                                     f"❌ '{zip_name}' 구글 드라이브 저장에 실패했어요. "
-                                    "드라이브 연결 설정(GDRIVE_SERVICE_ACCOUNT_JSON / GDRIVE_FOLDER_ID)을 확인해주세요."
+                                    "드라이브 연결 설정(GDRIVE_OAUTH_* / GDRIVE_FOLDER_ID)을 확인해주세요."
                                 ),
                             )
 
